@@ -405,6 +405,23 @@ impl Renderer {
         }
     }
 
+    /// `set_color` — the base rgba tint on a registered material
+    /// (color[0..4] in the uniform pack). Per-frame opacity arms write
+    /// `a` through here — uniform-pack data only, the texture bind
+    /// group is untouched.
+    ///
+    /// @param mat Material id. @param color rgba 0-1.
+    pub fn set_color(&mut self, mat: u32, color: [f32; 4]) {
+        if let Some(m) = self.mats.get_mut(mat as usize) {
+            match &mut m.record.material {
+                crate::material::Material::Basic { color: c, .. }
+                | crate::material::Material::Standard { color: c, .. }
+                | crate::material::Material::Sprite { color: c, .. }
+                | crate::material::Material::Points { color: c, .. } => *c = color,
+            }
+        }
+    }
+
     /// `pipe` — fetch-or-create the pipeline for (kind, side, blend).
     /// Lazily created and cached in `self.pipes` — pipeline creation
     /// compiles + validates a WGSL module (~ms), so it must never

@@ -359,6 +359,17 @@ impl Surface3d {
         self.r.set_emissive(mat, [r, g, b, a]);
     }
 
+    /// `set_color` — the base rgba on a registered material. Alpha is
+    /// the opacity slot — the per-frame label-fade/highlight arms
+    /// write this once per visible material (one uniform-pack row —
+    /// cheaper than rebuilding the record).
+    ///
+    /// @param mat Material id.
+    /// @param r @param g @param b @param a rgba 0-1.
+    pub fn set_color(&mut self, mat: u32, r: f32, g: f32, b: f32, a: f32) {
+        self.r.set_color(mat, [r, g, b, a]);
+    }
+
     // ── Nodes ──────────────────────────────────────────────────────
     // `parent` = u32::MAX attaches to the scene root.
 
