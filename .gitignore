@@ -1,0 +1,8 @@
+# Rust build artifacts — cargo/wasm-pack outputs, never committed.
+# Built .wasm + glue are copied into website/public/wasm/<crate>/ for serving.
+target/
+**/pkg/
+
+# Editor/OS noise.
+.DS_Store
+*.swp

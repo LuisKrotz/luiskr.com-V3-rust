@@ -1,0 +1,39 @@
+# luiskr.com-V3 Rust/WebGPU workspace.
+#
+# Houses the crates that back the dual-layer render architecture:
+# each crate compiles to wasm32-unknown-unknown and is driven from the
+# site through a minimal wasm-bindgen bridge (zero-copy input via wasm
+# linear memory, per-frame draw calls scheduled by the JS rAF owner so
+# the 120Hz/240Hz frame-budget governance keeps a single clock).
+#
+# Members:
+#   overlay — the invisible-DOM WebGPU surface: instanced quads, texture
+#             atlas, glyphon text staging, and the input ring that turns
+#             canvas pointer/wheel traffic into wasm-side hit tests.
+#
+# Build (opt-in, not wired into `yarn build` yet):
+#   cargo install wasm-pack
+#   cd rust/overlay && wasm-pack build --target web --release
+#
+# Adding another crate (star-field renderer, particle pool, etc.):
+#   cargo new rust/<name> --lib, add `crate-type = ["cdylib", "rlib"]`,
+#   register it under `members` below, and give the JS side a bridge
+#   module in core/utils/gpu/ with the same capability-gated fallback.
+
+[workspace]
+resolver = "2"
+members = ["diagram","overlay"]
+
+# Uniform release profile for every member (member-level [profile]
+# sections are ignored by cargo — profiles live ONLY at workspace
+# root): wasm size + speed both matter since the .wasm travels the
+# critical path. `lto = "fat"` links all codegen-units into one for
+# maximum cross-crate inlining; `codegen-units = 1` trades compile
+# time for the smallest/faster artifact; `panic = "abort"` strips
+# unwinding tables (wasm can't unwind anyway); `strip` drops symbols.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,40 @@
+# diagram — mermaid-subset parser + layout + SVG emitter.
+#
+# Replaces the `mermaid` npm dependency for docs diagrams. mermaid 12
+# ships ~1MB of JS for ~20 diagram families; this crate implements the
+# three families the docs corpus actually uses — `flowchart`,
+# `sequenceDiagram`, `mindmap` — in Rust, compiled to wasm32.
+#
+# Why SVG output (not canvas/WebGPU): diagram text must stay REAL text —
+# selectable, screen-reader reachable, indexable. The expensive part of
+# mermaid is parse + layout (CPU work — wasm's sweet spot); rasterizing
+# the result would trade accessibility for GPU time that buys nothing on
+# a static diagram. The DOM path also means the existing "restore source
+# on failure" fallback keeps working unchanged.
+#
+# API: one function — `render_diagram(source, theme_json) -> String`.
+# Returns the SVG markup or throws (JS-visible error string). The bridge
+# side lives in experiments/docs/mermaid.ts — same contract mermaid had:
+# source in, `<svg>` out, caller injects innerHTML.
+
+[package]
+name = "luiskr-diagram"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+# serde_json carries the theme map (colors/fonts) from JS — the diagram
+# inherits live CSS custom properties instead of hardcoding a palette.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Same wasm-opt note as overlay/: rustc's wasm32 baseline emits ops the
+# bundled wasm-opt rejects unless all features are enabled.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "-all"]
