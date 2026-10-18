@@ -19,12 +19,12 @@ to run as **N independent canvases** — each with its own WebGL context,
 its own `requestAnimationFrame` loop, its own clear pass, and its own
 shader plumbing. The costs of that structure:
 
-| Traditional structure | Cost it imposes |
-| --------------------- | --------------- |
-| N WebGL contexts | Each context reserves a command queue + swapchain; drivers cap contexts (~16) and evict the least-recently-used — pages with many canvases silently lose contexts. |
-| N rAF loops | Every loop wakes the main thread separately; wakeups can't batch, jitter multiplies, and frame-budget governance can't measure one clock. |
-| N clears + N composites | The compositor blends every canvas over the page every frame — full-screen overdraw per canvas even when each paints a 40px widget. |
-| State duplicated per canvas | Uniform math, resize handling, and device-pixel-ratio logic reimplemented per surface — every surface drifts. |
+| Traditional structure       | Cost it imposes                                                                                                                                                    |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| N WebGL contexts            | Each context reserves a command queue + swapchain; drivers cap contexts (~16) and evict the least-recently-used — pages with many canvases silently lose contexts. |
+| N rAF loops                 | Every loop wakes the main thread separately; wakeups can't batch, jitter multiplies, and frame-budget governance can't measure one clock.                          |
+| N clears + N composites     | The compositor blends every canvas over the page every frame — full-screen overdraw per canvas even when each paints a 40px widget.                                |
+| State duplicated per canvas | Uniform math, resize handling, and device-pixel-ratio logic reimplemented per surface — every surface drifts.                                                      |
 
 The architecture here replaces all of that with **one canvas, one
 surface, one clock, one render pass**, with every widget scissored to
@@ -148,11 +148,11 @@ Two regions inside wasm linear memory, exposed to JS as raw pointers:
 
 ### Changing the ring safely
 
-| Constant | Where | Safe range | Effect |
-| -------- | ----- | ---------- | ------ |
-| `RING_CAPACITY` (1024) | `input.rs` | 128–65536 | Larger = more sleeping-tab slack, more memory (16B/record). Must stay a power of two if wrap masking is added later. |
-| `RING_F32S` (cap×4) | `input.rs` | derived | Record stride — changing to 5+ floats per record requires updating the JS writer's stride and the drain's indexing together. |
-| `INPUT_TYPES` codes | `input.rs` + `webgpu-overlay.ts` | 0–255 practical | Must match EXACTLY on both sides — a mismatch silently reinterprets events. |
+| Constant               | Where                            | Safe range      | Effect                                                                                                                       |
+| ---------------------- | -------------------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `RING_CAPACITY` (1024) | `input.rs`                       | 128–65536       | Larger = more sleeping-tab slack, more memory (16B/record). Must stay a power of two if wrap masking is added later.         |
+| `RING_F32S` (cap×4)    | `input.rs`                       | derived         | Record stride — changing to 5+ floats per record requires updating the JS writer's stride and the drain's indexing together. |
+| `INPUT_TYPES` codes    | `input.rs` + `webgpu-overlay.ts` | 0–255 practical | Must match EXACTLY on both sides — a mismatch silently reinterprets events.                                                  |
 
 ---
 
@@ -198,16 +198,16 @@ the widget. Compared to issuing a proper quad per widget:
 `widgets/mod.rs::kinds` ⇄ `GPU_WIDGET_KINDS` in
 `core/tokens/motion/gpu-widgets.ts` — same numbers, same order:
 
-| kind | Rust | WGSL | Anim |
-| ---- | ---- | ---- | ---- |
-| 1 | `burger.rs` | `burger.wgsl` | 3-bar hamburger: staggered wave, breath, hover squeeze |
-| 2 | `flag.rs` | `flag.wgsl` | Locale flag: wind, flutter, split-texture, personality anim |
-| 3 | `switch_slider.rs` | `switch_slider.wgsl` | Context switch (ECG / blueprint / streaks) |
-| 4 | `theme_slider.rs` | `theme_slider.wgsl` | 3-stop night/system/day scene + ripple |
-| 5 | `close_button.rs` | `close_button.wgsl` | Liquid fill + bubbles + rotating X + shockwave |
-| 6 | `menu_background.rs` | `menu_background.wgsl` | Domain-warped fBM ink isolines |
-| 7 | `skeleton.rs` | `skeleton.wgsl` | Storage-buffer rect sheet + glyph resolve |
-| 8 | `burn.rs` | *(quad pass)* | CPU particle sim → shared instanced quads |
+| kind | Rust                 | WGSL                   | Anim                                                        |
+| ---- | -------------------- | ---------------------- | ----------------------------------------------------------- |
+| 1    | `burger.rs`          | `burger.wgsl`          | 3-bar hamburger: staggered wave, breath, hover squeeze      |
+| 2    | `flag.rs`            | `flag.wgsl`            | Locale flag: wind, flutter, split-texture, personality anim |
+| 3    | `switch_slider.rs`   | `switch_slider.wgsl`   | Context switch (ECG / blueprint / streaks)                  |
+| 4    | `theme_slider.rs`    | `theme_slider.wgsl`    | 3-stop night/system/day scene + ripple                      |
+| 5    | `close_button.rs`    | `close_button.wgsl`    | Liquid fill + bubbles + rotating X + shockwave              |
+| 6    | `menu_background.rs` | `menu_background.wgsl` | Domain-warped fBM ink isolines                              |
+| 7    | `skeleton.rs`        | `skeleton.wgsl`        | Storage-buffer rect sheet + glyph resolve                   |
+| 8    | `burn.rs`            | _(quad pass)_          | CPU particle sim → shared instanced quads                   |
 
 `spec_of(kind)` maps each to `{wgsl, uniform_f32s}`; `UNIFORM_F32S` in
 each `*.rs` mirrors `GPU_WIDGET_UNIFORM_F32S` on the TS side and is
@@ -363,14 +363,14 @@ glyphon prepares + renders them:
 
 ## 10. Surface configuration choices
 
-| Choice | Value | Why |
-| ------ | ----- | --- |
-| Present mode | `Mailbox` | Three modes exist: `Fifo` queues frames behind vsync (input lag grows at high Hz); `FifoRelaxed` tears; `Mailbox` presents the NEWEST finished frame and drops the rest. At 120/240Hz a queued frame is stale — mailbox minimizes pointer→pixel latency. |
-| Frame latency | 2 | The compositor already holds one frame; deeper queues add lag without throughput benefit — the layer is latency-bound, not bandwidth-bound. |
-| Format | sRGB preferred | DOM colors are sRGB; a non-sRGB target shifts every painted color a gamma step away from the DOM beneath it. `unwrap_or(formats[0])` keeps exotic displays alive. |
-| Power preference | `HighPerformance` | Requests the discrete GPU on hybrid laptops — the whole point of the layer. |
-| Blend | `ALPHA_BLENDING` | Standard `src·α + dst·(1−α)` — required for widgets/text/embers to composite over the page. |
-| Backends | `BROWSER_WEBGPU | GL` | WebGPU primary; the `webgl` wgpu feature allows a WebGL2-emulated surface on pre-WebGPU browsers that still support wasm (a middle rung above pure DOM fallback). |
+| Choice           | Value             | Why                                                                                                                                                                                                                                                      |
+| ---------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Present mode     | `Mailbox`         | Three modes exist: `Fifo` queues frames behind vsync (input lag grows at high Hz); `FifoRelaxed` tears; `Mailbox` presents the NEWEST finished frame and drops the rest. At 120/240Hz a queued frame is stale — mailbox minimizes pointer→pixel latency. |
+| Frame latency    | 2                 | The compositor already holds one frame; deeper queues add lag without throughput benefit — the layer is latency-bound, not bandwidth-bound.                                                                                                              |
+| Format           | sRGB preferred    | DOM colors are sRGB; a non-sRGB target shifts every painted color a gamma step away from the DOM beneath it. `unwrap_or(formats[0])` keeps exotic displays alive.                                                                                        |
+| Power preference | `HighPerformance` | Requests the discrete GPU on hybrid laptops — the whole point of the layer.                                                                                                                                                                              |
+| Blend            | `ALPHA_BLENDING`  | Standard `src·α + dst·(1−α)` — required for widgets/text/embers to composite over the page.                                                                                                                                                              |
+| Backends         | `BROWSER_WEBGPU   | GL`                                                                                                                                                                                                                                                      | WebGPU primary; the `webgl` wgpu feature allows a WebGL2-emulated surface on pre-WebGPU browsers that still support wasm (a middle rung above pure DOM fallback). |
 
 ---
 
@@ -397,16 +397,16 @@ pay nothing for it; modern browsers get the full GPU path.
 
 ## 12. Differences from a traditional app structure — summary
 
-| Traditional | This architecture | What it buys |
-| ----------- | ----------------- | ------------ |
-| N canvases, N contexts | 1 canvas, 1 surface | No context exhaustion, one clear, one composite |
-| N rAF loops | 1 rAF (JS-owned) | Single measurable clock; one visibility pause point |
-| JS-side sim + draw | Rust sim → shared instanced draw | Particles cost one draw call regardless of count |
-| Per-event FFI calls | Direct linear-memory writes | ~0 cost per event |
-| Per-frame Vec/alloc | Persistent scratch + geometric buffer growth | Steady frames allocate nothing |
-| DOM mirrors rebuilt ad hoc | `TextNode` slots updated on change only | Text cost ∝ changes, not frames |
-| One texture rebuild per video frame | `write_texture` into pooled slot | Video costs a texel memcpy, not resource churn |
-| Uniform buffer per draw call | Per-widget 256B buffer, updated in place | Bind groups never rebuild mid-stream |
+| Traditional                         | This architecture                            | What it buys                                        |
+| ----------------------------------- | -------------------------------------------- | --------------------------------------------------- |
+| N canvases, N contexts              | 1 canvas, 1 surface                          | No context exhaustion, one clear, one composite     |
+| N rAF loops                         | 1 rAF (JS-owned)                             | Single measurable clock; one visibility pause point |
+| JS-side sim + draw                  | Rust sim → shared instanced draw             | Particles cost one draw call regardless of count    |
+| Per-event FFI calls                 | Direct linear-memory writes                  | ~0 cost per event                                   |
+| Per-frame Vec/alloc                 | Persistent scratch + geometric buffer growth | Steady frames allocate nothing                      |
+| DOM mirrors rebuilt ad hoc          | `TextNode` slots updated on change only      | Text cost ∝ changes, not frames                     |
+| One texture rebuild per video frame | `write_texture` into pooled slot             | Video costs a texel memcpy, not resource churn      |
+| Uniform buffer per draw call        | Per-widget 256B buffer, updated in place     | Bind groups never rebuild mid-stream                |
 
 ---
 
@@ -415,15 +415,15 @@ pay nothing for it; modern browsers get the full GPU path.
 These MUST stay identical across the language boundary; a mismatch
 fails silently (wrong animation, never an error):
 
-| Contract | Rust side | TS side |
-| -------- | --------- | ------- |
-| Input kind codes | `input::kinds` | `INPUT_TYPES` in `webgpu-overlay.ts` |
-| Widget kinds | `widgets::kinds` | `GPU_WIDGET_KINDS` in `gpu-widgets.ts` |
-| Uniform sizes | `UNIFORM_F32S` per `*.rs` | `GPU_WIDGET_UNIFORM_F32S` |
-| Uniform slot layout | doc comment in each `*.rs` | the bridge's write order |
-| Flag anim codes | `flag::anims` | `FLAG_ANIMS` token |
-| Skeleton sheet | `RECT_FIELDS`/`STORAGE_VEC4S` | sheet write size (24×16 f32) |
-| Burn letter stride | 6 f32s/letter | flatten order x0,y0,x1,y1,v,delay |
+| Contract            | Rust side                     | TS side                                |
+| ------------------- | ----------------------------- | -------------------------------------- |
+| Input kind codes    | `input::kinds`                | `INPUT_TYPES` in `webgpu-overlay.ts`   |
+| Widget kinds        | `widgets::kinds`              | `GPU_WIDGET_KINDS` in `gpu-widgets.ts` |
+| Uniform sizes       | `UNIFORM_F32S` per `*.rs`     | `GPU_WIDGET_UNIFORM_F32S`              |
+| Uniform slot layout | doc comment in each `*.rs`    | the bridge's write order               |
+| Flag anim codes     | `flag::anims`                 | `FLAG_ANIMS` token                     |
+| Skeleton sheet      | `RECT_FIELDS`/`STORAGE_VEC4S` | sheet write size (24×16 f32)           |
+| Burn letter stride  | 6 f32s/letter                 | flatten order x0,y0,x1,y1,v,delay      |
 
 `set_widget_uniform` clamps writes to `spec.uniform_f32s`, so the size
 contract fails safe (truncation) rather than overflowing.
@@ -447,3 +447,71 @@ contract fails safe (truncation) rather than overflowing.
 - **`static` memory**: only the two `SyncCell` rings; single-thread
   contract documented at declaration. Don't add more shared statics —
   per-instance `RefCell` fields instead.
+
+---
+
+## 14. Threading model — why no SharedArrayBuffer / wasm-threads
+
+The crates are deliberately **single-threaded inside linear memory**.
+True shared-memory wasm threading (`Atomics`, `SharedArrayBuffer`,
+`-C target-feature=+atomics`) was evaluated and rejected; this section
+records the reasoning so nobody re-litigates it.
+
+### The hard requirement
+
+`SharedArrayBuffer` is only exposed when the document is
+**cross-origin isolated**, i.e. the server sends BOTH:
+
+    Cross-Origin-Opener-Policy: same-origin
+    Cross-Origin-Embedder-Policy: require-corp
+
+This site cannot send that pair:
+
+- `COOP: same-origin` breaks OAuth/popup flows and any
+  `window.open` hand-off; the current `same-origin-allow-popups`
+  value is deliberate.
+- `COEP: require-corp` makes the browser REFUSE every cross-origin
+  subresource that does not answer `Cross-Origin-Resource-Policy`.
+  All media is served from `storage.googleapis.com` (GCS does not
+  emit CORP on this bucket), so COEP would blank every cover,
+  video, and star-field texture on the site.
+
+### What we do instead — worker-pool threading
+
+Multi-threaded CPU work happens across **Web Workers** owned by
+`core/utils/wasm/wasm-pool.ts`:
+
+    main thread ──postMessage──▶ worker[0..N] each with own wasm instance
+                                   │
+                                   └─ zero-copy: ArrayBuffer is
+                                      TRANSFERRED (not copied);
+                                      ImageBitmap moves by reference
+
+- Each worker instantiates its own copy of the module — no shared
+  linear memory, so no COOP/COEP requirement.
+- CPU-heavy batch work (media decode, layout, hashing, hashing of
+  variant lists) is dispatched there; the main thread keeps
+  input + paint.
+- Workers communicate results via `postMessage` with transfer
+  lists — zero-copy semantics without shared memory.
+
+### Performance comparison
+
+| Approach               | Isolation header needed | Media from GCS  | Sync cost            |
+| ---------------------- | ----------------------- | --------------- | -------------------- |
+| SAB + atomics          | `crossOriginIsolated`   | BLOCKED by COEP | Shared-mem ops (~ns) |
+| Worker pool + transfer | none                    | works           | postMessage (~µs)    |
+
+For frame-budget work the difference is negligible: dispatches are
+batched per frame, not per pixel — µs-level message overhead is
+invisible against a 4ms/8ms frame budget, while COEP would be a
+hard site-wide media outage.
+
+### If the constraint ever changes
+
+Should every asset host gain `Cross-Origin-Resource-Policy: cross-origin`
+AND popups get redesigned, shared-memory wasm becomes reachable:
+compile with `-C target-feature=+atomics -C link-arg=--shared-memory`,
+gate on `globalThis.crossOriginIsolated === true`, and keep the
+worker-pool path as the fallback (the code must not REQUIRE SAB —
+Safari shipped isolation later and embedded webviews may never).
