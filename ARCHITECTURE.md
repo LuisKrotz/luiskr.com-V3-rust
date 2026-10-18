@@ -13,26 +13,67 @@ states the math, the intent, and the performance consequence.
 
 ## 1. The problem this solves
 
-The site's complex animations (flag waves, burger menu morph, tile
-burn, switches, theme slider, menu background, skeleton loaders) used
-to run as **N independent canvases** — each with its own WebGL context,
-its own `requestAnimationFrame` loop, its own clear pass, and its own
-shader plumbing. The costs of that structure:
+The site's complex animations (flag waves, burger morph, tile burn,
+switches, theme slider, menu background, skeleton loaders, media)
+each run on their own canvas. The traditional way to do that — N
+independent WebGL contexts driven from JS — imposes real costs:
 
-| Traditional structure       | Cost it imposes                                                                                                                                                    |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| N WebGL contexts            | Each context reserves a command queue + swapchain; drivers cap contexts (~16) and evict the least-recently-used — pages with many canvases silently lose contexts. |
-| N rAF loops                 | Every loop wakes the main thread separately; wakeups can't batch, jitter multiplies, and frame-budget governance can't measure one clock.                          |
-| N clears + N composites     | The compositor blends every canvas over the page every frame — full-screen overdraw per canvas even when each paints a 40px widget.                                |
-| State duplicated per canvas | Uniform math, resize handling, and device-pixel-ratio logic reimplemented per surface — every surface drifts.                                                      |
+| Traditional structure        | Cost it imposes                                                                                                                                                                                                   |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| N WebGL contexts             | Each reserves a command queue + swapchain; drivers cap contexts (~16) and evict the least-recently-used — pages with many canvases silently lose contexts.                                                        |
+| JS-side shader plumbing      | Uniform math, resize, DPR, and compile/link boilerplate re-implemented per surface in garbage-collected code.                                                                                                     |
+| One monolithic wasm artifact | The first iteration put every widget in ONE crate — it compiled to ~4 MB because the `wgpu` framework statically links ~3 MB per artifact. Splitting that across N crates would multiply the cost, not divide it. |
 
-The architecture here replaces all of that with **one canvas, one
-surface, one clock, one render pass**, with every widget scissored to
-its own rectangle inside it.
+The architecture here keeps the per-widget-canvas model (contexts are
+cheap and isolated) but replaces BOTH problems: **each animation is
+its own ~50 KB wasm artifact** built on raw `web-sys` WebGPU bindings —
+no framework, no monolith, fetched only when its surface mounts.
 
 ---
 
-## 2. The two-layer rule
+## 2. The per-artifact model — why the monolith died
+
+```text
+┌─ rust/overlay (RETIRED) ─────────────────────────────────────────┐
+│ every widget in one crate → links wgpu + glyphon + image          │
+│ artifact: ~4 MB — unacceptable on any load path                   │
+└──────────────────────────────────────────────────────────────────┘
+                          ▼ replaced by
+┌─ rust/gpu-mini (rlib, shared boilerplate) ───────────────────────┐
+│ raw web-sys WebGPU: init_surface, bind-group/pipeline helpers,    │
+│ textures, the uniform-widget scaffold — ~30 API calls total.      │
+│ Linked into each widget crate; dead code stripped per artifact.   │
+└──────────────────────────────────────────────────────────────────┘
+        │ linked into
+        ▼
+┌─ one cdylib per animation ───────────────────────────────────────┐
+│ skeleton 49KB · burger 50KB · flag 52KB · switch 48KB ·           │
+│ theme 53KB · close 47KB · menu-bg 47KB · burn 54KB · media 46KB   │
+│                                                                 │
+│ each = own GPUDevice + own canvas + own pipeline                 │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+Why this wins:
+
+- **Artifact size ∝ what the surface needs** — a widget pays ~50 KB
+  once, when its DOM canvas mounts. The skeleton (the loading
+  placeholder itself) is the only artifact allowed on the critical
+  path — it loads FIRST, at 49 KB.
+- **Isolated failures** — a shader compile error or device loss in
+  one widget can never stall another; each falls back to its own
+  WebGL/CSS twin independently.
+- **No vertex-buffer/sync glue across widgets** — each crate owns a
+  trivial pipeline (fullscreen triangle, one uniform block, maybe a
+  texture or storage buffer). The sync surface is per-widget: one
+  WGSL struct + one JS token entry.
+- **Device isolation is cheap** — WebGPU devices on separate canvases
+  coexist fine; the "N contexts" problem was a WebGL context-pool
+  limit, not a WebGPU constraint.
+
+---
+
+## 3. The two-layer rule
 
 ```text
 ┌────────────────────────────────────────────────────────────────┐
@@ -46,63 +87,53 @@ its own rectangle inside it.
                │  bridge mounts only when every capability passes
                ▼
 ┌────────────────────────────────────────────────────────────────┐
-│ Layer 1 — WebGPU canvas (paint only)                            │
+│ Layer 1 — per-widget WebGPU canvases (paint only)               │
 │                                                                │
-│  One fullscreen <canvas> behind/above the DOM. Rust+wasm drives  │
-│  wgpu; every widget is a scissored sub-rect with its own WGSL    │
-│  pipeline; text renders through glyphon; media through pooled    │
-│  textures. Paints pixels — owns no semantics.                   │
+│  Each widget's own <canvas> is driven by its own wasm artifact:  │
+│  Rust repacks a uniform block per frame and issues one draw.    │
+│  Paints pixels — owns no semantics.                             │
 └────────────────────────────────────────────────────────────────┘
 ```
 
 **The zero-regression rule:** Layer 1 can never hide content. If
 WebGPU is absent (Safari < 26, old Chrome/Firefox, IE, some Android
 WebViews), if the `.wasm` artifact fails to load, or if `init` throws —
-the bridge returns `null`, no canvas mounts, and the DOM renders
+the bridge returns `null` and the existing WebGL/CSS widget renders
 exactly as it always did. Acceleration is strictly additive.
-
-This is why the DOM mirror discipline exists: every pixel Layer 1
-paints has a DOM counterpart a crawler or screen reader can reach.
-SEO, accessibility, and reader mode are unaffected by the GPU path.
 
 ---
 
-## 3. Full data flow
+## 4. Full data flow
 
 ```text
- pointer/wheel events (passive, coalesced upstream)
+DOM surface mounts (nav opens, flag switches, menu expands…)
         │
         ▼
- JS bridge (core/utils/gpu/webgpu-overlay.ts)
-        │  writes packed f32 records DIRECTLY into wasm linear memory
-        │  at input_buffer_ptr(); bumps head at input_meta_ptr()
-        │  ── zero calls, zero copies, zero allocations per event ──
+JS bridge (core/utils/gpu/webgpu-widget.ts)
+  kind → GPU_WIDGET_ARTIFACTS[kind] → {url, cls, eager}
+        │  dynamic-imports /wasm/<slug>/<pkg>.js  (~50 KB, cached)
         ▼
-┌─ wasm linear memory ────────────────────────────────────────────┐
-│ INPUT_RING: 1024 records × [kind, x, y, payload]                 │
-│ INPUT_META: [head, tail]                                         │
-└─────────────────────────────────────────────────────────────────┘
-        │
-        ▼  once per rAF tick (JS owns the clock)
- Overlay::frame(dt_seconds)
-   1. drain ring → update hover (move/down only — see §6)
-   2. tick burn sims → particles emit quads into ONE shared buffer
-   3. write_buffer: entire quad array, one memcpy
-   4. encode ONE render pass:
-        clear → instanced quad draw → per-widget scissored draws
-        (sorted by rect.y, DOM paint order) → glyphon text
-   5. submit + present  (Mailbox mode — newest frame wins)
+Widget::new() → widget.init(canvas)      (async: adapter→device→configure)
+        │  rejection → null → WebGL/CSS fallback unchanged
+        ▼
+per rAF tick (the bridge owns the clock — single-clock rule):
+  widget.frame(dt_seconds)
+    1. repack the uniform f32 block (≤64 B, widget-local state)
+    2. queue.write_buffer — one upload
+    3. encoder → pass → pipeline → bind → draw(3|6|instanced)
+       → submit — the canvas presents on task end
         │
         ▼
- hover_group() → bridge routes click intents to the DOM router
+DOM pointer events → widget setters (set_state/tap/click/hover)
+   — each canvas hosts exactly one widget, so events map to setters
+     directly; no shared hit-test ring is needed.
 ```
 
 **Why JS owns the clock** (not a wasm-side loop): the project enforces
-a single 120Hz mobile / 240Hz desktop frame budget
-(`AGENTS.md` rule 27). One rAF means one measurable tick, one place to
-pause on `visibilitychange`, and no competing clocks. The wasm side
-never waits, never schedules, never sleeps — it computes what a frame
-needs when asked.
+a single 120Hz mobile / 240Hz desktop frame budget (`AGENTS.md`
+rule 27). One rAF per mounted widget means measurable ticks and one
+place to pause on `visibilitychange`. The wasm side never waits,
+never schedules — it computes what a frame needs when asked.
 
 **Why `dt` in seconds, never frame counts:** all motion integrates as
 `state += rate × dt`. At 60Hz dt≈0.0167s; at 240Hz dt≈0.0042s — the
@@ -113,225 +144,201 @@ for a refresh-rate change. Every shader comment tags its units.
 
 ---
 
-## 4. The input ring — zero-copy event transport
+## 5. gpu-mini — the shared layer that makes 50 KB possible
 
-Two regions inside wasm linear memory, exposed to JS as raw pointers:
+`rust/gpu-mini` is a plain `rlib` (never built to wasm itself) with
+the boilerplate every widget needs:
 
-```text
- INPUT_META  (i32[2])       INPUT_RING (f32[1024 × 4])
- ┌──────┬──────┐            ┌──────────────────────────────┐
- │ head │ tail │            │ [kind, x, y, payload] × 1024  │
- └──────┴──────┘            └──────────────────────────────┘
-        ▲ writer: JS event pump          ▲ reader: Rust drain()
-        (bumps head per record)          (bumps tail to head)
-```
+| Helper                                                          | What it wraps                                                                                     |
+| --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `init_surface(canvas)`                                          | `navigator.gpu` → adapter → device → canvas context → configure (async — the only async step)     |
+| `configure`/`resize`                                            | context re-bind after a canvas-bitmap resize                                                      |
+| `uniform_entry`/`storage_entry`/`texture_entry`/`sampler_entry` | bind-group layout entries                                                                         |
+| `new_buffer`/`write_f32s`/`f32_bytes`                           | buffer alloc + f32 upload (Pod reinterpret, no copy)                                              |
+| `new_layout`/`new_bind_group` + `bind_*_entry`                  | resource binding                                                                                  |
+| `fullscreen_pipeline`                                           | the widget-family pipeline: fullscreen triangle, no vertex buffers, premultiplied-alpha blend     |
+| `new_texture`/`upload_rgba`/`bitmap_texture`/`view`             | RGBA8 texture creation + uploads (flag halves, media)                                             |
+| `linear_sampler`                                                | shared bilinear clamp-to-edge sampler                                                             |
+| `draw`                                                          | get_current_texture → pass → pipeline → bind → scissor → draw(3) → submit; false on stale surface |
+| `init_widget`/`widget_frame`/`Widget`                           | the uniform-only scaffold — 90% of widgets are ~120 lines total because of it                     |
 
-- **Record layout**: `[kind, x, y, payload]` — kind is the
-  `INPUT_TYPES`/`input::kinds` discriminant (move=0, down=1, up=2,
-  wheel=3); x/y in canvas CSS pixels; payload is event-specific
-  (wheel deltaY already converted to px by the bridge).
-- **The writer never calls into wasm** — it writes 4 floats through a
-  `Float32Array` view over `memory.buffer`, then bumps `head` in an
-  `Int32Array` view. Per-event cost: 5 typed-array writes. No FFI call,
-  no serialization, no allocation.
-- **Overflow clamp**: when `head - tail > CAPACITY`, drain only
-  consumes the newest `CAPACITY - 1` records and skips the rest. Ring
-  wrap makes the newest records contiguous at the tail end — one
-  duplicated read (the in-flight newest record) is accepted rather
-  than risking a torn read of a record the JS writer might be
-  mid-write on. 1024 records ≈ 60Hz of events for 17 seconds of a
-  paused tab — overflow in practice means the tab slept, and skipping
-  stale input is the desired behavior anyway.
-- **Freshness upstream**: the bridge uses `getCoalescedEvents()` and
-  pushes only the freshest sample per native event — the ring never
-  carries intermediate positions the renderer would discard.
+Why raw `web-sys` and not `wgpu`: `wgpu` compiles the full Rust WebGPU
+stack (~3 MB) into every artifact; `web-sys` emits thin JS bindings
+where unused functions vanish at link time. The widget code itself is
+a few KB — the framework was the megabytes.
 
-### Changing the ring safely
-
-| Constant               | Where                            | Safe range      | Effect                                                                                                                       |
-| ---------------------- | -------------------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `RING_CAPACITY` (1024) | `input.rs`                       | 128–65536       | Larger = more sleeping-tab slack, more memory (16B/record). Must stay a power of two if wrap masking is added later.         |
-| `RING_F32S` (cap×4)    | `input.rs`                       | derived         | Record stride — changing to 5+ floats per record requires updating the JS writer's stride and the drain's indexing together. |
-| `INPUT_TYPES` codes    | `input.rs` + `webgpu-overlay.ts` | 0–255 practical | Must match EXACTLY on both sides — a mismatch silently reinterprets events.                                                  |
+**Stability note:** the web-sys GPU bindings are upstream-unstable —
+`.cargo/config.toml` sets `--cfg=web_sys_unstable_apis` for the wasm32
+target only. If a web-sys bump renames an API (it has happened —
+`GpuImageCopy*` → `GpuTexelCopy*`), the fixes land here once, not in
+every crate.
 
 ---
 
-## 5. The widget system
+## 6. The widget system
 
-Each animation surface registers once and receives an id:
-
-```text
- register_widget(kind, x, y, w, h)  →  id  (0 = rejected/fallback)
- set_widget_uniform(id, f32[])      →  per-frame state pushes
- set_widget_rect(id, x, y, w, h)    →  DOM-mirror rect moved
- unregister_widget(id)              →  resources drop
-```
-
-At frame time, every registered widget draws once, scissored to its
-rect:
+Each animation is a crate + a canvas + a registry entry:
 
 ```text
- fullscreen triangle (3 verts, no vertex buffer)
-        │
-        ▼  scissor = widget rect × (surface_px / css_px)
- fragment shader computes EVERYTHING procedurally:
-   - widget-local uv  = (fragXY − rect.xy) / res
-   - SDF shapes       (distance to bar/knob/track/…)
-   - fwidth() AA      (screen-space derivative = 1px edge)
-   - procedural anim  (time-driven sines/noise/eases)
+ mountWebGpuWidget(kind, canvas)
+   → GPU_WIDGET_ARTIFACTS[kind] = {url, cls, eager}
+   → import(url) → new mod[cls]() → init(canvas) → rAF loop
+   → handle.widget — kind-specific setters called directly:
+       burger.set_dark(v)           flag.set_state(hover,anim,split,split_x)
+       switch.set_state(p,knob,ctx) theme.set_state(p,knob) + theme.tap(t,x)
+       close.set_state(l,d,r)+click(t)  menu.set_state(reveal,colors…)
+       skeleton.write_sheet(f32s)+set_state(r,a,count)
+       burn.begin(dir,ox,oy,seed)+set_letters/ink/colors/dir/stage/origin
+       media.upload_bitmap(bmp)+push_frame(vf)+set_uv_rect(…)
 ```
 
-### Why fullscreen-triangle + scissor instead of real geometry
+### Why fullscreen-triangle instead of real geometry
 
-A fullscreen triangle is 3 vertices covering the viewport; the scissor
-clips it to the widget's rect so the fragment shader runs ONLY inside
-the widget. Compared to issuing a proper quad per widget:
+Every SDF widget draws a fullscreen triangle (3 verts synthesized in
+the vertex shader from `@builtin(vertex_index)` — no vertex buffer).
+On a dedicated canvas the fragment shader computes the widget-local
+`uv` itself. Compared to issuing geometry:
 
-- no vertex buffer, no index buffer, no vertex math per widget;
+- no vertex buffer, no index buffer, no vertex math;
 - the vertex stage is trivially free (3 fixed positions);
-- scissor is a hardware rasterizer feature — the clipped pixels never
-  invoke the fragment shader at all. A 40×40 burger costs ~1,600
-  fragment invocations, not a full screen's.
+- the fragment shader still does ALL the work — SDF edges, animation
+  waves, procedural fields — which is what the GPU is for.
+
+(Media and burn differ: media draws a 6-vertex unit quad because its
+uv→texture mapping is vertex-natural; burn draws `draw(6, instances)`
+with particle records in a storage buffer.)
 
 ### The kind registry (sync contract)
 
-`widgets/mod.rs::kinds` ⇄ `GPU_WIDGET_KINDS` in
-`core/tokens/motion/gpu-widgets.ts` — same numbers, same order:
+`GPU_WIDGET_KINDS` ⇄ `GPU_WIDGET_ARTIFACTS` in
+`core/tokens/motion/gpu-widgets.ts` ⇄ `rust/<slug>/` crates:
 
-| kind | Rust                 | WGSL                   | Anim                                                        |
-| ---- | -------------------- | ---------------------- | ----------------------------------------------------------- |
-| 1    | `burger.rs`          | `burger.wgsl`          | 3-bar hamburger: staggered wave, breath, hover squeeze      |
-| 2    | `flag.rs`            | `flag.wgsl`            | Locale flag: wind, flutter, split-texture, personality anim |
-| 3    | `switch_slider.rs`   | `switch_slider.wgsl`   | Context switch (ECG / blueprint / streaks)                  |
-| 4    | `theme_slider.rs`    | `theme_slider.wgsl`    | 3-stop night/system/day scene + ripple                      |
-| 5    | `close_button.rs`    | `close_button.wgsl`    | Liquid fill + bubbles + rotating X + shockwave              |
-| 6    | `menu_background.rs` | `menu_background.wgsl` | Domain-warped fBM ink isolines                              |
-| 7    | `skeleton.rs`        | `skeleton.wgsl`        | Storage-buffer rect sheet + glyph resolve                   |
-| 8    | `burn.rs`            | _(quad pass)_          | CPU particle sim → shared instanced quads                   |
-
-`spec_of(kind)` maps each to `{wgsl, uniform_f32s}`; `UNIFORM_F32S` in
-each `*.rs` mirrors `GPU_WIDGET_UNIFORM_F32S` on the TS side and is
-NOW enforced at write time: `set_widget_uniform` clamps the incoming
-slice to the declared size, so an oversized JS write truncates instead
-of overflowing the uniform layout.
+| kind | crate/artifact     | WGSL                   | Anim                                                               |
+| ---- | ------------------ | ---------------------- | ------------------------------------------------------------------ |
+| 1    | `burger/`          | `burger.wgsl`          | 3-bar hamburger: staggered wave, breath                            |
+| 2    | `flag/`            | `flag.wgsl`            | Locale flag: wind, split-texture, personality anim                 |
+| 3    | `switch-slider/`   | `switch_slider.wgsl`   | Context switch (ECG / blueprint / streaks)                         |
+| 4    | `theme-slider/`    | `theme_slider.wgsl`    | 3-stop night/system/day scene + ripple                             |
+| 5    | `close-button/`    | `close_button.wgsl`    | Liquid fill + bubbles + rotating X + shockwave                     |
+| 6    | `menu-background/` | `menu_background.wgsl` | Domain-warped fBM ink isolines                                     |
+| 7    | `skeleton/`        | `skeleton.wgsl`        | Storage-buffer rect sheet + glyph resolve — **eager: loads first** |
+| 8    | `burn/`            | `burn.wgsl`            | CPU particle sim → storage-buffer instanced quads                  |
+| 9    | `media/`           | `media.wgsl`           | Decoded image/video textured quad                                  |
 
 ### Uniform-block pattern
 
-Every widget's uniform starts with the same prologue
-(`[0..1]` resolution, then time/progress fields) and ends with the
-mirror rect (`[w-4..w-1]` x,y,w,h) — written once per state change by
-the bridge. Uniform buffers are 256B per widget (≥ the largest block,
-16 f32s = 64B) — sized once at registration, `write_buffer`-updated
-forever, never re-created.
+Every widget's uniform ends with a rect field (`(0,0,w,h)` — the whole
+canvas, since each canvas hosts one widget) and carries `res` = the
+canvas CSS px. Uniform buffers are 256 B per widget — sized once at
+init, `write_buffer`-updated per frame, never re-created.
 
 ### Adding a new widget — checklist
 
-1. Write `widgets/<name>.wgsl` — fullscreen `vs_main`, `fs_main` that
-   reads `uv`/`res`/`rect` from the Uniforms block.
-2. Write `widgets/<name>.rs` — `UNIFORM_F32S` + `WGSL` include + doc of
-   the slot layout (every slot's unit + safe range).
-3. Add `kinds::<NAME>` to `widgets/mod.rs` and a `spec_of` arm.
-4. Add the same discriminant + uniform size to
-   `core/tokens/motion/gpu-widgets.ts`.
-5. Register from the bridge where the DOM surface mounts; feed
-   `set_widget_uniform` from the component's existing state.
-6. If it's a burn-type sim instead of a shader, model on `burn.rs`.
+1. `rust/<slug>/Cargo.toml` — cdylib + `gpu-mini` path dep +
+   `wasm-opt = ["-Oz", "-all"]` metadata (copy `burger/`'s).
+2. `src/<slug>.wgsl` — fullscreen `vs_main`, `fs_main` reading the
+   Uniforms block.
+3. `src/lib.rs` — ~120 lines on `gpu_mini::init_widget`/`widget_frame`
+   (see `burger/`); use the primitives directly for textures/storage
+   (see `flag/`, `skeleton/`, `burn/`).
+4. `core/tokens/motion/gpu-widgets.ts` — `GPU_WIDGET_KINDS` id,
+   `GPU_WIDGET_ARTIFACTS` entry, `GPU_WIDGET_UNIFORM_F32S` count.
+5. `wasm-pack build` → `website/public/wasm/<slug>/`.
+6. Mount via `mountWebGpuWidget(kind, canvas)`; keep the WebGL path
+   behind the `null` return.
 
 ---
 
-## 6. Per-frame math, annotated
+## 7. Per-frame math, annotated
 
 ```rust
-// Stage 1 — input. Hit-test only on MOVE/DOWN: pointer-up leaves the
-// same widget under the cursor, wheel doesn't move it — skipping both
-// saves a scene traversal per event.
-drain(meta, ring, |kind, x, y, _| { … });
+// Per widget crate, per rAF tick:
+self.clock.set(self.clock.get() + dt);       // absorbed jitter
 
-// Stage 2 — sims emit quads. Burn particles integrate in dt-space;
-// all widgets' particles land in ONE Vec<Quad>.
-for sim in burns { sim.tick(dt, &mut scene.quads); }
+// Stage 1 — repack the uniform block (≤64 B, widget-local state).
+// The layout is field-for-field the WGSL `Uniforms` struct — see each
+// crate's module doc for the slot table.
+let uniforms: [f32; UNIFORM_F32S] = [res.x, res.y, clock, state…];
 
-// Stage 3 — upload. Geometric buffer growth (next_power_of_two):
-// O(log n) reallocations ever, then zero per frame — Vec::push logic.
-if quads.len() > cap { cap = quads.len().next_power_of_two(); … }
-queue.write_buffer(&quad_buf, 0, cast_slice(&quads));   // one memcpy
+// Stage 2 — one upload. The buffer was created once at init; this is
+// a ~64 B memcpy into an already-mapped queue write, not an alloc.
+gpu_mini::write_f32s(&queue, &ubuf, &uniforms);
 
-// Stage 4 — CSS→device scissor. sx = surface_px / css_px ≈ DPR.
-// .max(0.0) keeps partially-offscreen rects legal;
-// .min(width - x) clamps inside the surface (wgpu validates scissor).
-let x  = (rect.x * sx).max(0.0) as u32;
-let ww = (rect.w * sx).max(0.0) as u32;
-if ww == 0 || x >= surface_w { continue; }              // free cull
-pass.set_scissor_rect(x, y, ww.min(surface_w - x), hh.min(surface_h - y));
-pass.draw(0..3, 0..1);                                  // SDF widgets
-pass.draw(0..6, 0..1);                                  // media quads
+// Stage 3 — draw. get_current_texture → pass → pipeline → bind →
+// draw(0..3) → submit. The browser presents the canvas texture when
+// the current task ends (no explicit present in WebGPU JS).
+gpu_mini::draw(&surface, &pipeline, &bind, None)
+
+// Stage 4 — stale-surface recovery: draw() returns false when
+// get_current_texture fails (resize mid-frame, occluded tab);
+// the caller re-configures so the next rAF recovers — a missed
+// frame beats a panic.
+gpu_mini::resize(&surface);
 ```
 
-**The sort**: widgets draw sorted by `rect.y` — mirroring DOM paint
-order so stacked widgets composite the way their DOM twins would.
-The sort uses a persistent scratch `Vec<u32>` (`draw_order`) that is
-cleared and refilled each frame — the allocation happens once per
-session, not once per frame (zero-allocation frame rule, `AGENTS.md`
-rule 27). Widget ids sort through the `widgets` map, so the scratch
-holds plain `u32`s, not references — no borrow fights.
+**Zero-allocation frame rule**: the uniform array is a fixed
+`[f32; N]` on the stack; the buffer/pipeline/bind group were created
+at init; `frame` allocates nothing. The only frame-time allocation
+site anywhere is burn's instance growth — and that doubles
+geometrically, so steady frames never re-allocate.
 
 ---
 
-## 7. Media: decode and paint, off the main thread
+## 8. Media: decode and paint, off the main thread
 
 ```text
- image bytes (jpeg/png/webp fetched same-origin)
-   → upload_media_image(id, bytes)
-       image::load_from_memory → RGBA8            (pure Rust, in wasm)
-       make_slot → Texture + TextureView + BindGroup
-   → frame draws textured quad, cover-fit UVs
+ still image ──▶ JS createImageBitmap(blob)   (browser decodes
+        │        off-main-thread — hardware path)
+        ▼
+ media.upload_bitmap(bitmap, w, h)
+        │  copyExternalImageToTexture — GPU→GPU, no CPU pixels
+        ▼
+ frame draws textured quad, cover-fit UVs (JS computes uv_rect)
 
- video (mp4/webm)
-   → JS WebCodecs VideoDecoder → RGBA frame bytes
-   → push_video_frame(id, rgba, w, h)
-       same size: queue.write_texture into existing texture  ~µs
-       new size:  rebuild slot (texture + bind group)        ~ms, rare
+ video frame ──▶ JS WebCodecs VideoDecoder
+        │        requestVideoFrameCallback (NOT per rAF)
+        ▼
+ media.push_frame(VideoFrame, w, h) — same copy path, texture swap
 ```
 
 Design decisions, each deliberate:
 
+- **No `image` crate** — the browser's ImageBitmap decode is
+  hardware-backed and off-main-thread already; a Rust decoder would
+  cost ~800 KB of artifact AND run slower than the browser's JPEG path.
 - **`Rgba8Unorm`, not sRGB**: the surface is sRGB; marking the texture
   sRGB too would double-convert and wash colors out.
-- **`mip_level_count: 1`**: CDN derivatives are already widget-sized —
+- **Single mip level**: CDN derivatives are already widget-sized —
   mips would cost 33% more VRAM for aliasing that never happens.
-- **Usage = `TEXTURE_BINDING | COPY_DST` only**: no `RENDER_ATTACHMENT`,
-  no `COPY_SRC` — we never read pixels back (readbacks stall the queue).
-- **WebCodecs, not a Rust software decoder**: hardware video decode is
-  faster than any wasm codec and already ships in the browser; Rust
-  handles images because `image` is small, correct, and decode moves
-  off the main thread into the module.
-- **Texture pooling via `MediaSlot`**: the bind group wraps the same
-  texture forever — frame N costs one `write_texture`, never a bind
-  rebuild. Only a resolution change (adaptive streams) rebuilds.
+- **Usage = `TEXTURE_BINDING | COPY_DST` only**: we never read pixels
+  back (readbacks stall the queue).
+- **Rebind on swap**: bind groups are immutable, so each upload
+  creates a fresh texture + bind group — still cheap (µs), and it
+  keeps the steady-state draw path branch-free.
 
 ---
 
-## 8. Burn sim — CPU particles, GPU quads
+## 9. Burn sim — CPU particles, GPU instancing
 
-`widgets/burn.rs` reimplements `mosaic/burn/front.ts` in Rust:
+`burn/` reimplements `mosaic/burn/` in Rust (`sim.rs` — the same code
+the retired overlay crate used, emitting flat f32 records now):
 
 ```text
  per letter: own progress p_l = clamp(stage·v − delay, 0..1)
  front_y(x) = eased field height + jag_amp × edge_noise(x, t)
-   edge_noise = 3 detuned sines (0.09x·sin + 0.023x·sin + 0.17x·sin)
-                — frequencies picked non-harmonic so the edge never
-                  visibly repeats within a tile width
+   edge_noise = 3 detuned sines — non-harmonic frequencies so the
+                edge never visibly repeats within a tile width
  per particle: pos += vel·dt; life -= dt; alpha = life_curve(life)
  spawn rate ∝ front velocity × col_ink[x] (ink occupancy per column)
  RNG: xorshift32 — deterministic, allocation-free, replay-identical
- emitted: ≤110 particles → Quad{pos,size,uv,tint,z,group} each
+ emit: ≤110 particles × 16 f32s → storage buffer
 ```
 
-All particles across ALL burn widgets land in the shared `scene.quads`
-buffer → ONE instanced draw call paints every ember on the page. The
-110-particle cap (`P_MAX`) bounds worst-case work; the
-`Vec::with_capacity(P_MAX)` at sim creation means tick-time pushes
-never allocate.
+The emitted records land in a read-only storage buffer indexed by
+`@builtin(instance_index)` — one `draw(6, n)` call paints every ember.
+Storage-over-vertex-buffer was chosen because it needs no vertex-
+layout descriptors: one `write_buffer` per frame, one record shape to
+keep in sync (burn.wgsl's 4×vec4 doc).
 
 `set_dir(+1/−1)` restarts the particle stream (burn ↔ rebuild on
 un-hover) while keeping letters/ink/colors — matching the JS session's
@@ -339,74 +346,51 @@ hover-out replay exactly.
 
 ---
 
-## 9. Text — glyphon mirror
-
-DOM text nodes mirror into `TextNode` slots (`set_text`) only on
-content change — never per frame. Each frame rebuilds `TextJob`s and
-glyphon prepares + renders them:
-
-- **Why rebuild each frame is cheap**: glyphon caches shaped runs;
-  static strings re-shape nothing — prepare is a lookup.
-- **Why `max_width_px` is caller-supplied**: the DOM measured the wrap
-  width already; passing it in makes glyphon break lines at the same
-  point the accessible text breaks — rasterized output cannot diverge
-  from what a screen reader announces.
-- **Font gating mirrors the DOM gate**: `install_font` receives Fira
-  Sans bytes only for `ru` locales, Raleway elsewhere — same rule as
-  the stylesheet loader (`core/locale/cyrillic-font.ts`), so glyph
-  coverage and font payload match the DOM path exactly.
-- **Device-px rasterization**: `resize` forwards the surface size;
-  glyphon rasterizes at physical resolution so text stays crisp at
-  120Hz+ and on retina.
-
----
-
 ## 10. Surface configuration choices
 
-| Choice           | Value             | Why                                                                                                                                                                                                                                                      |
-| ---------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Present mode     | `Mailbox`         | Three modes exist: `Fifo` queues frames behind vsync (input lag grows at high Hz); `FifoRelaxed` tears; `Mailbox` presents the NEWEST finished frame and drops the rest. At 120/240Hz a queued frame is stale — mailbox minimizes pointer→pixel latency. |
-| Frame latency    | 2                 | The compositor already holds one frame; deeper queues add lag without throughput benefit — the layer is latency-bound, not bandwidth-bound.                                                                                                              |
-| Format           | sRGB preferred    | DOM colors are sRGB; a non-sRGB target shifts every painted color a gamma step away from the DOM beneath it. `unwrap_or(formats[0])` keeps exotic displays alive.                                                                                        |
-| Power preference | `HighPerformance` | Requests the discrete GPU on hybrid laptops — the whole point of the layer.                                                                                                                                                                              |
-| Blend            | `ALPHA_BLENDING`  | Standard `src·α + dst·(1−α)` — required for widgets/text/embers to composite over the page.                                                                                                                                                              |
-| Backends         | `BROWSER_WEBGPU   | GL`                                                                                                                                                                                                                                                      | WebGPU primary; the `webgl` wgpu feature allows a WebGL2-emulated surface on pre-WebGPU browsers that still support wasm (a middle rung above pure DOM fallback). |
+| Choice       | Value                        | Why                                                                                                                                              |
+| ------------ | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Present mode | browser default              | The WebGPU canvas context presents on task end; explicit mailbox/latency knobs aren't exposed to JS — the compositor owns scheduling either way. |
+| Format       | `getPreferredCanvasFormat()` | The browser's native swapchain format (usually bgra8unorm) — zero conversion cost and guaranteed compatible.                                     |
+| Alpha mode   | `premultiplied`              | Every shader emits premultiplied rgb; the blend state and canvas mode agree so the canvas composites over the DOM correctly.                     |
+| Blend        | premultiplied-over           | `src·1 + dst·(1−src.a)` — required for widgets to composite over the page.                                                                       |
+| Backends     | WebGPU only                  | No wgpu `webgl` feature anywhere — pre-WebGPU browsers take the existing WebGL/2D fallback widgets instead of an emulated path.                  |
 
 ---
 
 ## 11. Capability gating & the compat lane
 
 ```text
- mountWebGpuOverlay()
-   navigator.gpu? ──no──▶ return null → DOM path (unchanged)
-   wasm artifact? ─no──▶ return null → DOM path
-   init() throws? ──yes─▶ return null → DOM path
+ mountWebGpuWidget(kind, canvas)
+   spec missing?   ──yes──▶ return null → WebGL/CSS path (unchanged)
+   navigator.gpu?  ──no───▶ return null → WebGL/CSS path
+   artifact 404?   ──yes──▶ return null → WebGL/CSS path
+   init() throws?  ──yes──▶ return null → WebGL/CSS path
         │
         ▼
- Overlay live: canvas mounts, listeners attach (passive),
- widgets register, rAF starts — hidden-tab pauses the loop.
+ Widget live: listeners attach (passive), rAF starts —
+   hidden-tab pauses the loop; destroy() reaps everything.
 ```
 
 Legacy browsers (Safari < 26, Chrome < 113, Firefox < 141, IE10/11,
 old iOS) never reach the wasm path — they get the DOM/canvas-2D/WebGL
 fallbacks that already exist, plus the legacy tier bundles the build
-emits (`dist/v/es2016`/`es2017`). Layer 1 never ships to them, so they
-pay nothing for it; modern browsers get the full GPU path.
+emits (`dist/v/es2016`/`es2017`/`ie`). The artifacts never ship to
+them, so they pay nothing; modern browsers get the full GPU path.
 
 ---
 
 ## 12. Differences from a traditional app structure — summary
 
-| Traditional                         | This architecture                            | What it buys                                        |
-| ----------------------------------- | -------------------------------------------- | --------------------------------------------------- |
-| N canvases, N contexts              | 1 canvas, 1 surface                          | No context exhaustion, one clear, one composite     |
-| N rAF loops                         | 1 rAF (JS-owned)                             | Single measurable clock; one visibility pause point |
-| JS-side sim + draw                  | Rust sim → shared instanced draw             | Particles cost one draw call regardless of count    |
-| Per-event FFI calls                 | Direct linear-memory writes                  | ~0 cost per event                                   |
-| Per-frame Vec/alloc                 | Persistent scratch + geometric buffer growth | Steady frames allocate nothing                      |
-| DOM mirrors rebuilt ad hoc          | `TextNode` slots updated on change only      | Text cost ∝ changes, not frames                     |
-| One texture rebuild per video frame | `write_texture` into pooled slot             | Video costs a texel memcpy, not resource churn      |
-| Uniform buffer per draw call        | Per-widget 256B buffer, updated in place     | Bind groups never rebuild mid-stream                |
+| Traditional                           | This architecture                              | What it buys                                                       |
+| ------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------ |
+| One ~4MB wasm monolith                | ~50KB artifact per animation                   | Widgets pay only for what mounts; skeleton rides the critical path |
+| `wgpu` Rust framework                 | `web-sys` bindings via `gpu-mini`              | ~60× smaller artifacts; dead code stripped per widget              |
+| JS-side sim + draw per particle       | Rust sim → one storage-buffer instanced draw   | Particles cost one draw call regardless of count                   |
+| Rust `image` decode                   | `ImageBitmap`/`VideoFrame` → copyExternalImage | Hardware decode, GPU→GPU copy, ~800KB less code                    |
+| Per-frame Vec/alloc                   | Fixed-size uniform arrays + geometric growth   | Steady frames allocate nothing                                     |
+| Per-widget vertex buffers/descriptors | Fullscreen triangle / storage-buffer instances | One record shape per widget; no layout descriptors to drift        |
+| A shared canvas + hit-test ring       | Per-widget canvases, events → setters          | No ring protocol; each canvas hosts one widget                     |
 
 ---
 
@@ -415,18 +399,16 @@ pay nothing for it; modern browsers get the full GPU path.
 These MUST stay identical across the language boundary; a mismatch
 fails silently (wrong animation, never an error):
 
-| Contract            | Rust side                     | TS side                                |
-| ------------------- | ----------------------------- | -------------------------------------- |
-| Input kind codes    | `input::kinds`                | `INPUT_TYPES` in `webgpu-overlay.ts`   |
-| Widget kinds        | `widgets::kinds`              | `GPU_WIDGET_KINDS` in `gpu-widgets.ts` |
-| Uniform sizes       | `UNIFORM_F32S` per `*.rs`     | `GPU_WIDGET_UNIFORM_F32S`              |
-| Uniform slot layout | doc comment in each `*.rs`    | the bridge's write order               |
-| Flag anim codes     | `flag::anims`                 | `FLAG_ANIMS` token                     |
-| Skeleton sheet      | `RECT_FIELDS`/`STORAGE_VEC4S` | sheet write size (24×16 f32)           |
-| Burn letter stride  | 6 f32s/letter                 | flatten order x0,y0,x1,y1,v,delay      |
-
-`set_widget_uniform` clamps writes to `spec.uniform_f32s`, so the size
-contract fails safe (truncation) rather than overflowing.
+| Contract            | Rust side                             | TS side                                                                           |
+| ------------------- | ------------------------------------- | --------------------------------------------------------------------------------- |
+| Widget kinds        | `rust/<slug>/` dir ↔ registry         | `GPU_WIDGET_KINDS` in `gpu-widgets.ts`                                            |
+| Artifact url+class  | crate name + `#[wasm_bindgen]` struct | `GPU_WIDGET_ARTIFACTS[kind]`                                                      |
+| Uniform sizes       | `UNIFORM_F32S` per `lib.rs`           | `GPU_WIDGET_UNIFORM_F32S`                                                         |
+| Uniform slot layout | doc comment in each `lib.rs`          | the bridge/component's write order                                                |
+| Flag anim codes     | `flag/` anim doc                      | `GPU_FLAG_ANIMS` token                                                            |
+| Skeleton sheet      | `SHEET_VEC4S`/`MAX_RECTS`             | sheet write size (24×16 f32)                                                      |
+| Burn letter stride  | 6 f32s/letter                         | flatten order x0,y0,x1,y1,v,delay                                                 |
+| Skeleton WGSL copy  | `skeleton/src/skeleton.wgsl`          | `overlay/`'s retired copy documents the lineage — edit both if the shader changes |
 
 ---
 
@@ -437,20 +419,23 @@ contract fails safe (truncation) rather than overflowing.
   px-space numbers (switch slider, close button) assume the design
   size stated at the top of the file — resizing the control means
   re-tuning those constants.
-- **Numbers in `*.rs`**: capacity/protocol constants. `RING_CAPACITY`,
-  `P_MAX`, `WIDGET_UBUF_SIZE`, `STORAGE_VEC4S` — documented per
-  constant; raising capacity is always safe, lowering below the
-  stated minimum breaks validation or truncates.
-- **wgpu calls**: validation errors panic on wasm (uncatchable). The
-  code pre-clamps everything wgpu validates (scissor bounds, texture
-  dims ≥1, write sizes) — keep those clamps when editing.
-- **`static` memory**: only the two `SyncCell` rings; single-thread
-  contract documented at declaration. Don't add more shared statics —
-  per-instance `RefCell` fields instead.
+- **Numbers in `*.rs`**: capacity/protocol constants (`MAX_RECTS`,
+  `UNIFORM_F32S`, `START_CAP`) — documented per constant; raising
+  capacity is always safe, lowering below the stated minimum breaks
+  validation or truncates.
+- **web-sys calls**: most GPU constructors return `Result`; init-time
+  failures become `expect` traps (a JS-visible abort the bridge's
+  try/catch turns into a fallback). Frame-time calls return bools —
+  never panic in `frame`.
+- **Clamp before the GPU**: state setters clamp progress/hover/alpha
+  to documented ranges — keep those clamps when editing; an
+  out-of-range uniform produces wrong pixels, not an error.
+- **`RefCell` everywhere**: wasm is single-threaded here (see §15) —
+  interior mutability is the idiom, never `static mut`.
 
 ---
 
-## 14. Threading model — why no SharedArrayBuffer / wasm-threads
+## 15. Threading model — why no SharedArrayBuffer / wasm-threads
 
 The crates are deliberately **single-threaded inside linear memory**.
 True shared-memory wasm threading (`Atomics`, `SharedArrayBuffer`,
@@ -489,9 +474,8 @@ Multi-threaded CPU work happens across **Web Workers** owned by
 
 - Each worker instantiates its own copy of the module — no shared
   linear memory, so no COOP/COEP requirement.
-- CPU-heavy batch work (media decode, layout, hashing, hashing of
-  variant lists) is dispatched there; the main thread keeps
-  input + paint.
+- CPU-heavy batch work (media conversion, layout, hashing) is
+  dispatched there; the main thread keeps input + paint.
 - Workers communicate results via `postMessage` with transfer
   lists — zero-copy semantics without shared memory.
 

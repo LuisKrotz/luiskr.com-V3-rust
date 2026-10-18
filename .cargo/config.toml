@@ -1,0 +1,7 @@
+# Workspace cargo config — the web-sys WebGPU bindings are unstable
+# upstream and gated behind `web_sys_unstable_apis`; every widget crate
+# in this workspace uses them, so the flag lives once at the root for
+# the wasm32 target only (host builds, e.g. `cargo test`, don't see it
+# and would flag the cfg as unexpected).
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]

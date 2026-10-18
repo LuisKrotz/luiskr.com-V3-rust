@@ -1,0 +1,27 @@
+# media — decoded-image + video-frame widget (textured quad). Own
+# artifact, lazy-loaded when a GPU media surface mounts. Decode stays
+# browser-side (ImageBitmap / VideoFrame → copyExternalImageToTexture)
+# — no `image` crate, no CPU pixel round-trip.
+
+[package]
+name = "luiskr-media"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+gpu-mini = { path = "../gpu-mini" }
+
+[dependencies.web-sys]
+version = "0.3"
+features = ["HtmlCanvasElement", "gpu_buffer_usage", "ImageBitmap", "VideoFrame"]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "-all"]

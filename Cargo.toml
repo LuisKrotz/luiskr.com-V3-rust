@@ -22,7 +22,11 @@
 
 [workspace]
 resolver = "2"
-members = ["diagram","overlay"]
+members = [
+  "burn","burger","close-button","diagram","flag",
+  "gpu-mini","media","menu-background","scene3d",
+  "skeleton","switch-slider","theme-slider",
+]
 
 # Uniform release profile for every member (member-level [profile]
 # sections are ignored by cargo — profiles live ONLY at workspace

@@ -1,0 +1,36 @@
+# skeleton — the FIRST-loading WebGPU crate.
+#
+# The loading skeleton is the only GPU surface users see before the app
+# boots, so it can NOT ride inside the overlay artifact (~4 MB, lazy by
+# design). This crate is deliberately minimal — one pipeline, two
+# buffers, one canvas — so its wasm stays tiny enough to sit on the
+# critical path: fetched with the first paint, shimmering while the
+# real bundles stream in.
+#
+# It is a sibling of `rust/overlay`, not a dependency of it — the
+# overlay's SKELETON kind is reserved (id 7) but renders nothing there;
+# JS mounts this crate's surface instead. The .wgsl is byte-identical
+# to overlay's copy; the sync contract is documented in lib.rs.
+
+[package]
+name = "luiskr-skeleton"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+gpu-mini = { path = "../gpu-mini" }
+
+[dependencies.web-sys]
+version = "0.3"
+features = ["HtmlCanvasElement", "gpu_buffer_usage"]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "-all"]

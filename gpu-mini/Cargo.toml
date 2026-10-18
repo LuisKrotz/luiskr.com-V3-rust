@@ -1,0 +1,109 @@
+# gpu-mini — shared WebGPU boilerplate over raw web-sys bindings.
+#
+# This crate exists to keep the per-widget artifacts TINY. `wgpu`
+# compiles the full Rust WebGPU stack (~3 MB) into every artifact that
+# links it; `web-sys` emits thin JS bindings where only the functions
+# actually called land in the wasm — a widget crate using gpu-mini
+# lands at ~50-150 KB. That is what makes the one-artifact-per-widget
+# architecture viable: each animation ships alone, fetched only when
+# its DOM surface mounts.
+#
+# This is an internal `rlib` — never built to wasm itself. Every widget
+# crate links it and dead-code-eliminates whatever it doesn't use.
+#
+# Dependency note: only web-sys feature-gated GPU types + js-sys +
+# wasm-bindgen-futures. Adding a dep here multiplies it across every
+# widget artifact — keep it bare.
+
+[package]
+name = "gpu-mini"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+  "HtmlCanvasElement",
+  "Window",
+  "Navigator",
+  # ── WebGPU bindings (only what the widget crates call) ──────────
+  "Gpu",
+  "GpuAdapter",
+  "GpuDevice",
+  "GpuQueue",
+  "GpuBuffer",
+  "GpuBufferDescriptor",
+  "gpu_buffer_usage",
+  "gpu_texture_usage",
+  "GpuShaderModule",
+  "GpuShaderModuleDescriptor",
+  "gpu_shader_stage",
+  "GpuPipelineLayout",
+  "GpuPipelineLayoutDescriptor",
+  "GpuRenderPipeline",
+  "GpuRenderPipelineDescriptor",
+  "GpuVertexState",
+  "GpuFragmentState",
+  "GpuColorTargetState",
+  "GpuBlendState",
+  "GpuBlendComponent",
+  "GpuBlendFactor",
+  "GpuBlendOperation",
+  "GpuPrimitiveState",
+  "GpuBindGroupLayout",
+  "GpuBindGroupLayoutDescriptor",
+  "GpuBindGroupLayoutEntry",
+  "GpuBufferBindingLayout",
+  "GpuBufferBindingType",
+  "GpuSamplerBindingLayout",
+  "GpuSamplerBindingType",
+  "GpuTextureBindingLayout",
+  "GpuStorageTextureBindingLayout",
+  "GpuBindGroup",
+  "GpuBindGroupDescriptor",
+  "GpuBindGroupEntry",
+  "GpuBufferBinding",
+  "GpuCommandEncoder",
+  "GpuCommandEncoderDescriptor",
+  "GpuCommandBuffer",
+  "GpuRenderPassEncoder",
+  "GpuRenderPassDescriptor",
+  "GpuRenderPassColorAttachment",
+  "GpuCanvasContext",
+  "GpuCanvasConfiguration",
+  "GpuCanvasAlphaMode",
+  "GpuTexture",
+  "GpuTextureDescriptor",
+  "GpuTextureView",
+  "GpuTextureViewDescriptor",
+  "gpu_texture_usage",
+  "gpu_map_mode",
+  "gpu_color_write",
+  "GpuTextureFormat",
+  "GpuTextureDimension",
+  "GpuTextureAspect",
+  "GpuSampler",
+  "GpuSamplerDescriptor",
+  "GpuAddressMode",
+  "GpuFilterMode",
+  "GpuLoadOp",
+  "GpuStoreOp",
+  "GpuColorDict",
+  "GpuTexelCopyTextureInfo",
+  "GpuTexelCopyBufferLayout",
+  "GpuExtent3dDict",
+  "GpuOrigin2dDict",
+  "GpuCopyExternalImageSourceInfo",
+  "GpuCopyExternalImageDestInfo",
+  "ImageBitmap",
+]

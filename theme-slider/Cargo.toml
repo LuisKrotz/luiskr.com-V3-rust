@@ -1,0 +1,26 @@
+# theme-slider — the day/system/night preference slider (full
+# procedural sky scene: stars, sun, aurora, moon, mesas, 3D knob).
+# Own artifact, lazy-loaded when the prefs UI mounts.
+
+[package]
+name = "luiskr-theme-slider"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+gpu-mini = { path = "../gpu-mini" }
+
+[dependencies.web-sys]
+version = "0.3"
+features = ["HtmlCanvasElement"]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "-all"]

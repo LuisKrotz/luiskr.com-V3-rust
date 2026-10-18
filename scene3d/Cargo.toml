@@ -1,0 +1,47 @@
+# scene3d — the WebGPU 3D renderer that replaces three.js for the
+# experiments (star-field bodies-scene, earth-playground globe).
+#
+# This crate exists because `three@0.184` ships ~600KB of JS to drive a
+# scene that uses a fixed, small subset of its surface: procedural
+# sphere/ring/box/plane geometry, basic+standard+sprite+points
+# materials, canvas textures, an orbit camera, and a TSL post chain.
+# Porting that subset to wgpu-in-wasm moves ALL scene work — transform
+# propagation, frustum tests, draw dispatch — off the JS main thread,
+# and drops the served artifact to a fraction of three's chunk.
+#
+# Architecture: a flat scene graph (indices, not pointers), a typed
+# resource registry for geometries/materials/textures, and a single
+# forward pass + TSL-parity post chain (film grain, chromatic
+# aberration, bloom) — all documented per-field in `math.rs` and
+# `lib.rs`.
+
+[package]
+name = "luiskr-scene3d"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+gpu-mini = { path = "../gpu-mini" }
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+  "HtmlCanvasElement",
+  "CanvasRenderingContext2d",
+  "Performance",
+  "Window",
+]
+
+# Same wasm-opt flag contract as overlay/diagram: rustc's wasm32
+# baseline emits bulk-memory/multivalue ops the bundled wasm-opt
+# rejects without `-all`.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "-all"]
