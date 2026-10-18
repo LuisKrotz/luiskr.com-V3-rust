@@ -1,0 +1,32 @@
+# divider-sheen — the footer hairline with a traveling accent band.
+#
+# Replaces the CSS `::after` translateX sheen on `.footer-source-divider`
+# and `.internal-footer-items-divider` with one uniform-only widget —
+# the shader draws the hairline gradient AND the sweeping accent band,
+# so the whole divider visual lives on one canvas.
+#
+# The `web-sys` surface is gpu-mini's — nothing widget-specific here.
+
+[package]
+name = "luiskr-divider-sheen"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+gpu-mini = { path = "../gpu-mini" }
+
+[dependencies.web-sys]
+version = "0.3"
+features = ["HtmlCanvasElement", "gpu_buffer_usage"]
+
+# Same wasm-opt flag contract as every widget crate.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "-all"]

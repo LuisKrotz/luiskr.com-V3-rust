@@ -1,0 +1,37 @@
+# corner-brackets — the button corner-bracket expansion widget.
+#
+# Replaces the ::before/::after corner-bracket animation on
+# `.preferences-footer-action`, `.awards-selected-action`, and
+# `.awards-explore-action`: four L-brackets at a button's corners
+# whose arms grow from a stub to the full border length on
+# hover/focus. Per-button widget (buttons are sparse, one canvas
+# each — unlike the ring overlay which batches a whole grid).
+#
+# Uniform-only — no storage, no textures: the bracket state is six
+# scalars + a color, so the frame cost is one uniform write + draw(6).
+#
+# The `web-sys` surface is gpu-mini's — nothing widget-specific here.
+
+[package]
+name = "luiskr-corner-brackets"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+gpu-mini = { path = "../gpu-mini" }
+
+[dependencies.web-sys]
+version = "0.3"
+features = ["HtmlCanvasElement", "gpu_buffer_usage"]
+
+# Same wasm-opt flag contract as every widget crate.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "-all"]

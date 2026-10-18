@@ -29,15 +29,104 @@ crate-type = ["cdylib", "rlib"]
 wasm-bindgen = "0.2"
 js-sys = "0.3"
 wasm-bindgen-futures = "0.4"
-gpu-mini = { path = "../gpu-mini" }
 
+# The WebGPU surface only exists on wasm32 — scoping the dep keeps the
+# pure-CPU modules (math, geometry) compilable + testable on the host
+# (`cargo test -p luiskr-scene3d` runs the geometry invariants without
+# a browser).
+[target.'cfg(target_arch = "wasm32")'.dependencies.gpu-mini]
+path = "../gpu-mini"
+
+# web-sys feature list — the same WebGPU surface gpu-mini declares,
+# plus the vertex/primitive/depth types renderer.rs names directly
+# (feature unification covers what each crate USES in its own code —
+# a crate must declare every type it names).
 [dependencies.web-sys]
 version = "0.3"
 features = [
   "HtmlCanvasElement",
-  "CanvasRenderingContext2d",
-  "Performance",
   "Window",
+  "Navigator",
+  "Gpu",
+  "GpuAdapter",
+  "GpuDevice",
+  "GpuQueue",
+  "GpuBuffer",
+  "GpuBufferDescriptor",
+  "gpu_buffer_usage",
+  "gpu_texture_usage",
+  "GpuShaderModule",
+  "GpuShaderModuleDescriptor",
+  "gpu_shader_stage",
+  "GpuPipelineLayout",
+  "GpuPipelineLayoutDescriptor",
+  "GpuRenderPipeline",
+  "GpuRenderPipelineDescriptor",
+  "GpuVertexState",
+  "GpuVertexBufferLayout",
+  "GpuVertexAttribute",
+  "GpuVertexFormat",
+  "GpuVertexStepMode",
+  "GpuFragmentState",
+  "GpuColorTargetState",
+  "GpuBlendState",
+  "GpuBlendComponent",
+  "GpuBlendFactor",
+  "GpuBlendOperation",
+  "GpuPrimitiveState",
+  "GpuPrimitiveTopology",
+  "GpuCullMode",
+  "GpuFrontFace",
+  "GpuIndexFormat",
+  "GpuDepthStencilState",
+  "GpuCompareFunction",
+  "GpuStencilFaceState",
+  "GpuBindGroupLayout",
+  "GpuBindGroupLayoutDescriptor",
+  "GpuBindGroupLayoutEntry",
+  "GpuBufferBindingLayout",
+  "GpuBufferBindingType",
+  "GpuSamplerBindingLayout",
+  "GpuSamplerBindingType",
+  "GpuTextureBindingLayout",
+  "GpuStorageTextureBindingLayout",
+  "GpuBindGroup",
+  "GpuBindGroupDescriptor",
+  "GpuBindGroupEntry",
+  "GpuBufferBinding",
+  "GpuCommandEncoder",
+  "GpuCommandEncoderDescriptor",
+  "GpuCommandBuffer",
+  "GpuRenderPassEncoder",
+  "GpuRenderPassDescriptor",
+  "GpuRenderPassColorAttachment",
+  "GpuRenderPassDepthStencilAttachment",
+  "GpuCanvasContext",
+  "GpuCanvasConfiguration",
+  "GpuCanvasAlphaMode",
+  "GpuTexture",
+  "GpuTextureDescriptor",
+  "GpuTextureView",
+  "GpuTextureViewDescriptor",
+  "gpu_map_mode",
+  "gpu_color_write",
+  "GpuTextureFormat",
+  "GpuTextureDimension",
+  "GpuTextureAspect",
+  "GpuSampler",
+  "GpuSamplerDescriptor",
+  "GpuAddressMode",
+  "GpuFilterMode",
+  "GpuLoadOp",
+  "GpuStoreOp",
+  "GpuColorDict",
+  "GpuTexelCopyTextureInfo",
+  "GpuTexelCopyBufferLayout",
+  "GpuExtent3dDict",
+  "GpuOrigin2dDict",
+  "GpuCopyExternalImageSourceInfo",
+  "GpuCopyExternalImageDestInfo",
+  "ImageBitmap",
 ]
 
 # Same wasm-opt flag contract as overlay/diagram: rustc's wasm32

@@ -497,3 +497,238 @@ pub fn ray_from_screen(
         dir: world_dir,
     }
 }
+
+// ── Quat ────────────────────────────────────────────────────────────
+
+/// `Quat` — a rotation quaternion (x, y, z, w). The scene graph stores
+/// rotation as a quaternion (the mathematically clean form — no gimbal
+/// lock, composes by multiplication) and exposes Euler angles only as
+/// a conversion view, the same split three.js makes between
+/// `object.quaternion` (authoritative) and `object.rotation` (view).
+///
+/// Unit quaternions only: every constructor here normalizes, so
+/// `to_mat4` can use the optimized unit-quaternion formula (the general
+/// form would need an extra 1/|q|² scale term).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Quat {
+    /// Imaginary x (rotation about the x axis contribution).
+    pub x: f32,
+    /// Imaginary y.
+    pub y: f32,
+    /// Imaginary z.
+    pub z: f32,
+    /// Real part — cos(θ/2) for a rotation of θ about the xyz axis.
+    pub w: f32,
+}
+
+impl Quat {
+    /// `Quat::IDENTITY` — the zero rotation (0,0,0,1): w=1 means θ=0.
+    pub const IDENTITY: Quat = Quat::new(0.0, 0.0, 0.0, 1.0);
+
+    /// `Quat::new` — const constructor; callers constructing from raw
+    /// halves of axis-angle should pass through `normalized` after.
+    ///
+    /// @param x @param y @param z Imaginary components (axis·sin(θ/2)).
+    /// @param w Real component (cos(θ/2)).
+    /// @returns The quaternion record.
+    pub const fn new(x: f32, y: f32, z: f32, w: f32) -> Self {
+        Self { x, y, z, w }
+    }
+
+    /// `from_euler` — convert three.js's default XYZ-order Euler angles
+    /// into a quaternion. XYZ order composes as q = qx ⊗ qy ⊗ qz —
+    /// each axis's half-angle quaternion:
+    ///   q_axis = (axis·sin(a/2), cos(a/2))
+    /// Expanding the triple product analytically (rather than doing two
+    /// general quaternion muls) gives the closed form below — the same
+    /// expansion three.js's Quaternion.setFromEuler uses, so ported
+    /// `rotation.set(x,y,z)` calls produce identical orientations.
+    ///
+    /// @param x Radians about the x axis. @param y About y. @param z About z.
+    /// @returns Unit quaternion of the composed rotation.
+    pub fn from_euler(x: f32, y: f32, z: f32) -> Quat {
+        let (sx, cx) = (x * 0.5).sin_cos();
+        let (sy, cy) = (y * 0.5).sin_cos();
+        let (sz, cz) = (z * 0.5).sin_cos();
+
+        // qx⊗qy⊗qz expanded — each term is a product of one
+        // component from each axis's half-quaternion.
+        Quat::new(
+            sx * cy * cz + cx * sy * sz,
+            cx * sy * cz - sx * cy * sz,
+            cx * cy * sz + sx * sy * cz,
+            cx * cy * cz - sx * sy * sz,
+        )
+    }
+
+    /// `to_mat4` — the rotation matrix of this unit quaternion.
+    ///
+    /// Derivation — for q=(x,y,z,w) the rotation of vector v is
+    /// v' = q·v·q̄; expanding into matrix form (and folding the unit
+    /// normalization into the diagonal terms via x²+y²+z²+w²=1):
+    ///   ⎡ 1−2(y²+z²)   2(xy−zw)    2(xz+yw) ⎤
+    ///   ⎢ 2(xy+zw)   1−2(x²+z²)    2(yz−xw) ⎥
+    ///   ⎣ 2(xz−yw)    2(yz+xw)   1−2(x²+y²) ⎦
+    /// Translation column stays zero — this is rotation only.
+    ///
+    /// @returns Column-major rotation matrix.
+    pub fn to_mat4(self) -> Mat4 {
+        let (x, y, z, w) = (self.x, self.y, self.z, self.w);
+        let x2 = x + x;
+        let y2 = y + y;
+        let z2 = z + z;
+
+        // Precompute the 9 products once each — the matrix entries
+        // reuse them pairwise (e.g. xy appears with ±zw in m[1]/m[4]).
+        let xx = x * x2;
+        let xy = x * y2;
+        let xz = x * z2;
+        let yy = y * y2;
+        let yz = y * z2;
+        let zz = z * z2;
+        let wx = w * x2;
+        let wy = w * y2;
+        let wz = w * z2;
+
+        let mut m = Mat4::IDENTITY.m;
+
+        m[0] = 1.0 - (yy + zz);
+        m[1] = xy + wz;
+        m[2] = xz - wy;
+        m[4] = xy - wz;
+        m[5] = 1.0 - (xx + zz);
+        m[6] = yz + wx;
+        m[8] = xz + wy;
+        m[9] = yz - wx;
+        m[10] = 1.0 - (xx + yy);
+
+        Mat4 { m }
+    }
+
+    /// `from_mat4` — recover a quaternion from a pure rotation matrix.
+    /// Needed by `look_at`, which builds an orthonormal basis first and
+    /// extracts the quaternion second — going through the matrix keeps
+    /// the code path shared with every other basis-building routine.
+    ///
+    /// Shepperd's method: pick the formula branch by which diagonal
+    /// element is largest — each branch divides by 4·(that component),
+    /// so choosing the max keeps the divisor farthest from zero (the
+    /// naive single-formula version has catastrophic cancellation near
+    /// 180° rotations).
+    ///
+    /// @param m A matrix whose upper-left 3×3 is a rotation (no scale
+    ///          or shear — callers must strip those first).
+    /// @returns Unit quaternion of the rotation.
+    pub fn from_mat4(m: &Mat4) -> Quat {
+        let trace = m.m[0] + m.m[5] + m.m[10];
+        let q;
+
+        if trace > 0.0 {
+            // w is the dominant component — the numerically happy path.
+            let s = (trace + 1.0).sqrt() * 2.0; // s = 4w
+
+            q = Quat::new(
+                (m.m[6] - m.m[9]) / s,
+                (m.m[8] - m.m[2]) / s,
+                (m.m[1] - m.m[4]) / s,
+                s * 0.25,
+            );
+        } else if m.m[0] > m.m[5] && m.m[0] > m.m[10] {
+            let s = (1.0 + m.m[0] - m.m[5] - m.m[10]).sqrt() * 2.0; // 4x
+
+            q = Quat::new(
+                s * 0.25,
+                (m.m[4] + m.m[1]) / s,
+                (m.m[8] + m.m[2]) / s,
+                (m.m[6] - m.m[9]) / s,
+            );
+        } else if m.m[5] > m.m[10] {
+            let s = (1.0 + m.m[5] - m.m[0] - m.m[10]).sqrt() * 2.0; // 4y
+
+            q = Quat::new(
+                (m.m[4] + m.m[1]) / s,
+                s * 0.25,
+                (m.m[9] + m.m[6]) / s,
+                (m.m[8] - m.m[2]) / s,
+            );
+        } else {
+            let s = (1.0 + m.m[10] - m.m[0] - m.m[5]).sqrt() * 2.0; // 4z
+
+            q = Quat::new(
+                (m.m[8] + m.m[2]) / s,
+                (m.m[9] + m.m[6]) / s,
+                s * 0.25,
+                (m.m[1] - m.m[4]) / s,
+            );
+        }
+
+        q.normalized()
+    }
+
+    /// `mul` — quaternion composition `self ⊗ o`: applies `o` FIRST,
+    /// then `self` — the same convention as `Mat4::mul` so quaternion
+    /// and matrix pipelines agree (node_world = parent ⊗ local).
+    ///
+    /// Expansion of (w1 + v1)(w2 + v2) for vector part v:
+    ///   w = w1w2 − v1·v2
+    ///   v = w1v2 + w2v1 + v1×v2
+    ///
+    /// @param o The quaternion applied first.
+    /// @returns The composed rotation (not normalized — see normalized).
+    pub fn mul(self, o: Quat) -> Quat {
+        Quat::new(
+            self.w * o.x + self.x * o.w + self.y * o.z - self.z * o.y,
+            self.w * o.y - self.x * o.z + self.y * o.w + self.z * o.x,
+            self.w * o.z + self.x * o.y - self.y * o.x + self.z * o.w,
+            self.w * o.w - self.x * o.x - self.y * o.y - self.z * o.z,
+        )
+    }
+
+    /// `normalized` — q ÷ |q|. Composition drifts magnitude off 1 over
+    /// long chains; a non-unit quaternion silently introduces a scale
+    /// of |q|² into `to_mat4`. Renormalizing is 4 mul + 1 rsqrt — cheap
+    /// insurance per compose.
+    ///
+    /// Guard: |q|<1e-9 returns IDENTITY (a zero quaternion has no
+    /// direction to preserve).
+    ///
+    /// @returns Unit-length quaternion.
+    pub fn normalized(self) -> Quat {
+        let l = (self.x * self.x + self.y * self.y + self.z * self.z + self.w * self.w).sqrt();
+
+        if l < 1e-9 {
+            return Quat::IDENTITY;
+        }
+
+        let inv = 1.0 / l;
+
+        Quat::new(self.x * inv, self.y * inv, self.z * inv, self.w * inv)
+    }
+}
+
+impl Mat4 {
+    /// `Mat4::compose` — the TRS local matrix: M = T · R · S.
+    ///
+    /// Rightmost-applies-first: scale the geometry in object space,
+    /// rotate the result, then translate to the node's position — the
+    /// only order matching every engine's scene graph (scale must not
+    /// stretch the translation vector; rotation must not orbit the
+    /// translation).
+    ///
+    /// @param t Translation (node position in parent space).
+    /// @param q Rotation quaternion.
+    /// @param s Per-axis scale.
+    /// @returns The composed local transform.
+    pub fn compose(t: Vec3, q: Quat, s: Vec3) -> Mat4 {
+        // T·R — rotate-then-translate — then fold scale into the basis
+        // columns (scaling columns scales applied vectors, i.e. R·S).
+        let mut m = q.to_mat4().mul(Mat4::scale(s));
+
+        m.m[12] = t.x;
+        m.m[13] = t.y;
+        m.m[14] = t.z;
+
+        m
+    }
+}

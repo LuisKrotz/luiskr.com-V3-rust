@@ -529,3 +529,68 @@ pub fn draw(
     // canvas frame when the current task completes.
     true
 }
+
+/// `draw_n` — the instanced/vertex-counted variant of `draw`: same
+/// acquire→pass→submit shape, but the draw call takes an explicit
+/// vertex count + instance count. Used by instanced widgets
+/// (text-draw's per-char quads) whose vertex shader synthesizes
+/// geometry from `vertex_index`+`instance_index` against a storage
+/// buffer — still no vertex buffers.
+///
+/// @param surface The live canvas surface.
+/// @param pipeline The render pipeline.
+/// @param bind The frame bind group.
+/// @param scissor Optional clip rect in device px.
+/// @param verts Vertices per instance.
+/// @param instances Instance count (1 for non-instanced custom draws).
+/// @returns true when the frame submitted; false on a stale surface.
+pub fn draw_n(
+    surface: &Surface,
+    pipeline: &GpuRenderPipeline,
+    bind: &GpuBindGroup,
+    scissor: Option<[u32; 4]>,
+    verts: u32,
+    instances: u32,
+) -> bool {
+    let tex = match surface.context.get_current_texture() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+
+    let view = match tex.create_view() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let clear = GpuColorDict::new(0.0, 0.0, 0.0, 0.0);
+    let attach = GpuRenderPassColorAttachment::new_with_gpu_texture_view(
+        GpuLoadOp::Clear,
+        GpuStoreOp::Store,
+        &view,
+    );
+    attach.set_clear_value_gpu_color_dict(&clear);
+
+    let attachments = [js_sys::JsNullable::wrap(attach)];
+    let pass_desc = GpuRenderPassDescriptor::new(&attachments);
+
+    let encoder = surface
+        .device
+        .create_command_encoder_with_descriptor(&GpuCommandEncoderDescriptor::new());
+
+    match encoder.begin_render_pass(&pass_desc) {
+        Ok(pass) => {
+            pass.set_pipeline(pipeline);
+            if let Some([x, y, w, h]) = scissor {
+                pass.set_scissor_rect(x, y, w, h);
+            }
+            pass.set_bind_group(0, Some(bind));
+            pass.draw_with_instance_count(verts, instances);
+            pass.end();
+        }
+        Err(_) => return false,
+    }
+
+    surface.queue.submit(&[encoder.finish()]);
+
+    true
+}

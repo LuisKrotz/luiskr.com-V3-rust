@@ -23,9 +23,9 @@
 [workspace]
 resolver = "2"
 members = [
-  "burn","burger","close-button","diagram","flag",
-  "gpu-mini","media","menu-background","scene3d",
-  "skeleton","switch-slider","theme-slider",
+  "burn","burger","close-button","corner-brackets","diagram","divider-sheen",
+  "flag","glitch","gpu-mini","markdown","media","menu-background","ring-sheen","scene3d",
+  "skeleton","switch-slider","text-draw","theme-slider",
 ]
 
 # Uniform release profile for every member (member-level [profile]
