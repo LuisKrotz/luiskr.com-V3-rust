@@ -52,10 +52,14 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
 @fragment
 fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // The original ran in a dedicated 28px-tall canvas; normalize into
-    // the widget rect and continue in its own px space.
+    // the widget rect and continue in its own px space. WGSL `frag`
+    // is framebuffer-origin (y=0 at TOP) while the ported GLSL math
+    // assumes gl_FragCoord/v_uv semantics (y=0 at BOTTOM) — uv.y is
+    // flipped here so every constant below measures from the bottom
+    // edge exactly like the original shader did.
     let uv = vec2<f32>(
         (frag.x - u.rect.x) / u.rect.z,
-        (frag.y - u.rect.y) / u.rect.w,
+        1.0 - (frag.y - u.rect.y) / u.rect.w,
     );
     let pixel = uv * u.res;
 

@@ -122,7 +122,11 @@ fn parse_msg(actors: &mut Vec<Actor>, line: &str) -> Option<Msg> {
     let from = find_or_push(actors, from_name);
     let to = find_or_push(actors, to_name);
     let label = label_lines(text);
-    let label = if label.is_empty() { vec![String::new()] } else { label };
+    let label = if label.is_empty() {
+        vec![String::new()]
+    } else {
+        label
+    };
 
     Some(Msg {
         from,
@@ -157,7 +161,11 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
 
             actors.push(Actor {
                 id,
-                lines: if label.is_empty() { vec![spec.to_string()] } else { label },
+                lines: if label.is_empty() {
+                    vec![spec.to_string()]
+                } else {
+                    label
+                },
                 x: 0.0,
                 w: 0.0,
             });
@@ -186,9 +194,11 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
         // Delimiter keywords mermaid emits — consume silently so they
         // don't produce bogus messages: `end`, `loop`, `alt`, `else`,
         // `opt`, `par`, `activate`, `deactivate`, `autonumber`.
-        if ["end", "loop", "alt", "else", "opt", "par", "critical", "break", "rect"]
-            .iter()
-            .any(|k| line == *k || line.starts_with(&format!("{k} ")))
+        if [
+            "end", "loop", "alt", "else", "opt", "par", "critical", "break", "rect",
+        ]
+        .iter()
+        .any(|k| line == *k || line.starts_with(&format!("{k} ")))
             || line.starts_with("activate")
             || line.starts_with("deactivate")
             || line.starts_with("autonumber")
@@ -242,12 +252,41 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
     }
 
     let bottom = y + MARGIN;
-    let total_w = MARGIN * 2.0 + pitch * actors.len() as f32;
+    let mut total_w = MARGIN * 2.0 + pitch * actors.len() as f32;
+
+    // Painted horizontal bounds — a self-message label hangs off the
+    // loop stub to the RIGHT of its lifeline and a `Note over` band is
+    // centered on the lifeline midpoint, so both can overshoot the
+    // column grid on either side. Folding them into the width keeps the
+    // viewBox from clipping them.
+    let mut min_x = 0.0f32;
+    let stub = COL_GAP.min(80.0) * 0.5;
+
+    for m in &msgs {
+        if m.from != m.to {
+            continue;
+        }
+
+        let (lw, _) = svg::label_size(&m.label, theme);
+        let cx = actors[m.from].x + stub / 2.0 + 8.0;
+
+        min_x = min_x.min(cx - lw / 2.0);
+        total_w = total_w.max(cx + lw / 2.0 + MARGIN);
+    }
+    for (cx_col, _row, lines) in &notes {
+        let (nw, _) = svg::label_size(lines, theme);
+        let cx = MARGIN + pitch * (cx_col + 0.5);
+
+        min_x = min_x.min(cx - nw / 2.0 - MARGIN);
+        total_w = total_w.max(cx + nw / 2.0 + MARGIN);
+    }
+
+    let origin_x = min_x.min(0.0);
 
     // ── Emit ────────────────────────────────────────────────────────
     let mut out = String::with_capacity(4096 + msgs.len() * 240);
 
-    svg::open(&mut out, total_w, bottom);
+    svg::open(&mut out, origin_x, 0.0, total_w - origin_x, bottom);
 
     // Lifelines first (under everything): dashed verticals from below
     // the head row to the last row.

@@ -28,12 +28,12 @@
 use crate::camera::{Camera, Orbit};
 use crate::geometry as geo;
 use crate::material::{Blending, Flags, Material, Record, Side};
-use crate::math::{Mat4, Vec3};
 use crate::math::Quat;
+use crate::math::{Mat4, Vec3};
 use crate::renderer::Renderer;
 use crate::scene::{Kind, NodeId, Scene};
 use wasm_bindgen::prelude::*;
-use web_sys::{HtmlCanvasElement, ImageBitmap};
+use web_sys::{GpuDevice, HtmlCanvasElement, ImageBitmap};
 
 /// `Surface3d` — the exported scene handle: the engine state (scene,
 /// camera, renderer) plus the per-frame scalar state JS pushes through
@@ -58,23 +58,34 @@ pub struct Surface3d {
     post: [f32; 3],
 }
 
-/// `mount` — the async constructor (WebGPU init is a promise):
-/// adapter → device → surface configure → renderer. Mirrors the
-/// widget crates' `mount(canvas)` contract so the shared
-/// `webgpu-widget.ts` bridge can drive it with the same mount-first,
-/// fallback-on-failure flow.
+/// `mount` — bind a canvas to the page's SHARED GPUDevice and build
+/// the renderer around it. The device is acquired once in JS
+/// (`getSharedGpuDevice`) and passed to every artifact — per-widget
+/// devices exhausted the driver's device budget on a widget-heavy
+/// page (Windows/D3D12: `create command queue failed with
+/// E_OUTOFMEMORY` after ~100 devices). Sync: with the device in hand
+/// there is nothing to await, and a synchronous constructor can never
+/// leave a wasm-bindgen closure dangling (the async-future trap was
+/// the "closure invoked recursively" cascade). `await` on the JS side
+/// tolerates the non-promise return unchanged.
 ///
 /// @param canvas The host canvas element.
+/// @param device The shared GPUDevice (one per page, from the JS bridge).
 /// @param w @param h Backing size in DEVICE pixels.
 /// @returns The scene handle, or a JS error string on init failure.
 #[wasm_bindgen]
-pub async fn mount(canvas: HtmlCanvasElement, w: u32, h: u32) -> Result<Surface3d, JsValue> {
-    let surface = gpu_mini::init_surface(&canvas).await?;
+pub fn mount(
+    canvas: HtmlCanvasElement,
+    device: GpuDevice,
+    w: u32,
+    h: u32,
+) -> Result<Surface3d, JsValue> {
+    let surface = gpu_mini::init_surface(&canvas, &device)?;
 
     Ok(Surface3d {
         scene: Scene::new(),
         cam: Camera::new(45.0, 0.1, 4000.0),
-        r: Renderer::new(surface, w, h),
+        r: Renderer::new(surface, w, h)?,
         light: (Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0), 1.0),
         clear: [0.0, 0.0, 0.0, 0.0],
         post: [0.0, 0.0, 0.0],
@@ -114,7 +125,9 @@ impl Surface3d {
     /// @param as_points True → billboard-quad expansion (Points).
     /// @returns The geometry registry id.
     pub fn gen_sphere(&mut self, radius: f32, ws: u32, hs: u32, as_points: bool) -> u32 {
-        self.r.upload_geometry(&geo::sphere(radius, ws, hs), as_points)
+        self.r
+            .upload_geometry(&geo::sphere(radius, ws, hs), as_points)
+            .unwrap_or(u32::MAX)
     }
 
     /// `gen_plane` — XY plane generator passthrough.
@@ -123,7 +136,9 @@ impl Surface3d {
     /// @param as_points Points-expansion flag.
     /// @returns The geometry registry id.
     pub fn gen_plane(&mut self, w: f32, h: f32, as_points: bool) -> u32 {
-        self.r.upload_geometry(&geo::plane(w, h), as_points)
+        self.r
+            .upload_geometry(&geo::plane(w, h), as_points)
+            .unwrap_or(u32::MAX)
     }
 
     /// `gen_ring` — flat ring generator passthrough.
@@ -135,6 +150,7 @@ impl Surface3d {
     pub fn gen_ring(&mut self, inner: f32, outer: f32, segments: u32, as_points: bool) -> u32 {
         self.r
             .upload_geometry(&geo::ring(inner, outer, segments), as_points)
+            .unwrap_or(u32::MAX)
     }
 
     /// `gen_box` — box generator passthrough.
@@ -143,7 +159,9 @@ impl Surface3d {
     /// @param as_points Points-expansion flag.
     /// @returns The geometry registry id.
     pub fn gen_box(&mut self, w: f32, h: f32, d: f32, as_points: bool) -> u32 {
-        self.r.upload_geometry(&geo::box_mesh(w, h, d), as_points)
+        self.r
+            .upload_geometry(&geo::box_mesh(w, h, d), as_points)
+            .unwrap_or(u32::MAX)
     }
 
     /// `gen_cylinder` — cylinder generator passthrough.
@@ -155,6 +173,7 @@ impl Surface3d {
     pub fn gen_cylinder(&mut self, rt: f32, rb: f32, h: f32, segs: u32, as_points: bool) -> u32 {
         self.r
             .upload_geometry(&geo::cylinder(rt, rb, h, segs), as_points)
+            .unwrap_or(u32::MAX)
     }
 
     /// `gen_torus` — torus generator passthrough.
@@ -173,6 +192,7 @@ impl Surface3d {
     ) -> u32 {
         self.r
             .upload_geometry(&geo::torus(radius, tube, radial, tubular), as_points)
+            .unwrap_or(u32::MAX)
     }
 
     /// `gen_icosahedron` — icosahedron generator passthrough.
@@ -184,6 +204,7 @@ impl Surface3d {
     pub fn gen_icosahedron(&mut self, radius: f32, detail: u32, as_points: bool) -> u32 {
         self.r
             .upload_geometry(&geo::icosahedron(radius, detail), as_points)
+            .unwrap_or(u32::MAX)
     }
 
     /// `gen_tetrahedron` — tetrahedron generator passthrough.
@@ -194,6 +215,7 @@ impl Surface3d {
     pub fn gen_tetrahedron(&mut self, radius: f32, as_points: bool) -> u32 {
         self.r
             .upload_geometry(&geo::tetrahedron(radius), as_points)
+            .unwrap_or(u32::MAX)
     }
 
     /// `upload_geometry` — arbitrary vertex data (the custom
@@ -222,7 +244,7 @@ impl Surface3d {
             indices: indices.to_vec(),
         };
 
-        self.r.upload_geometry(&g, as_points)
+        self.r.upload_geometry(&g, as_points).unwrap_or(u32::MAX)
     }
 
     /// `upload_texture` — register a decoded ImageBitmap (the
@@ -231,9 +253,10 @@ impl Surface3d {
     ///
     /// @param bitmap The JS-decoded bitmap.
     /// @param w @param h Pixel size.
-    /// @returns The texture registry id.
+    /// @returns The texture registry id (u32::MAX on a device fault —
+    ///   materials bind the white fallback rather than panicking).
     pub fn upload_texture(&mut self, bitmap: &ImageBitmap, w: u32, h: u32) -> u32 {
-        self.r.upload_texture(bitmap, w, h)
+        self.r.upload_texture(bitmap, w, h).unwrap_or(u32::MAX)
     }
 
     // ── Materials ──────────────────────────────────────────────────
@@ -379,9 +402,7 @@ impl Surface3d {
     /// @param geo Geometry id. @param mat Material id.
     /// @returns The new node id.
     pub fn add_mesh(&mut self, parent: u32, geo: u32, mat: u32) -> u32 {
-        self.scene
-            .add(to_parent(parent), Kind::Mesh { geo, mat })
-            .0
+        self.scene.add(to_parent(parent), Kind::Mesh { geo, mat }).0
     }
 
     /// `add_points` — Points(geo, mat).
@@ -667,8 +688,15 @@ impl Surface3d {
     /// @param time Elapsed seconds (shader clocks).
     /// @param dpr Device pixel ratio (point-size compensation).
     pub fn frame(&mut self, time: f32, dpr: f32) {
-        self.r
-            .frame(&mut self.scene, &mut self.cam, time, dpr, self.light, self.clear, self.post);
+        self.r.frame(
+            &mut self.scene,
+            &mut self.cam,
+            time,
+            dpr,
+            self.light,
+            self.clear,
+            self.post,
+        );
     }
 
     /// `ray_at` — screen-space picking ray: NDC pixel → world-space
@@ -703,7 +731,14 @@ impl Surface3d {
             self.cam.position,
         );
 
-        vec![ray.origin.x, ray.origin.y, ray.origin.z, ray.dir.x, ray.dir.y, ray.dir.z]
+        vec![
+            ray.origin.x,
+            ray.origin.y,
+            ray.origin.z,
+            ray.dir.x,
+            ray.dir.y,
+            ray.dir.z,
+        ]
     }
 
     /// `destroy` — release the surface (GpuDevice drops with the
@@ -716,5 +751,9 @@ impl Surface3d {
 /// @param id The JS-side parent id.
 /// @returns `Some(NodeId)` or `None` for root attachment.
 fn to_parent(id: u32) -> Option<NodeId> {
-    if id == u32::MAX { None } else { Some(NodeId(id)) }
+    if id == u32::MAX {
+        None
+    } else {
+        Some(NodeId(id))
+    }
 }

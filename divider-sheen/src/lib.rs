@@ -30,7 +30,7 @@
 
 use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
-use web_sys::{gpu_buffer_usage, HtmlCanvasElement};
+use web_sys::{gpu_buffer_usage, GpuDevice, HtmlCanvasElement};
 
 /// WGSL — hairline + traveling band shader.
 const WGSL: &str = include_str!("divider_sheen.wgsl");
@@ -91,25 +91,26 @@ impl DividerSheen {
     /// `init` — device + pipeline + the single bind group.
     ///
     /// @param canvas The divider's overlay canvas.
+    /// @param device The shared GPUDevice (one per page, from the JS bridge).
     /// @returns Ok on a live surface, Err(JsValue) on failure.
-    pub async fn init(&self, canvas: HtmlCanvasElement) -> Result<(), JsValue> {
-        let surface = gpu_mini::init_surface(&canvas).await?;
+    pub fn init(&self, canvas: HtmlCanvasElement, device: GpuDevice) -> Result<(), JsValue> {
+        let surface = gpu_mini::init_surface(&canvas, &device)?;
 
         // binding 0 uniform — the WGSL's declared contract.
-        let layout = gpu_mini::new_layout(&surface.device, &[gpu_mini::uniform_entry(0)]);
+        let layout = gpu_mini::new_layout(&surface.device, &[gpu_mini::uniform_entry(0)])?;
 
         let pipeline = gpu_mini::fullscreen_pipeline(
             &surface.device,
             surface.format,
             WGSL,
             &[layout.clone()],
-        );
+        )?;
 
         let ubuf = gpu_mini::new_buffer(
             &surface.device,
             (UNIFORM_F32S * 4) as u32,
             gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST,
-        );
+        )?;
 
         let bind = gpu_mini::new_bind_group(
             &surface.device,
@@ -117,7 +118,13 @@ impl DividerSheen {
             &[gpu_mini::bind_buffer_entry(0, &ubuf)],
         );
 
-        *self.gpu.borrow_mut() = Some(Gpu {
+        // try_borrow everywhere: a JS exception crossing a wasm frame
+        // mid-call leaks the RefCell guard — a later borrow() panics
+        // `unreachable` (the observed widget-crash cascade).
+        let Ok(mut slot) = self.gpu.try_borrow_mut() else {
+            return Err(JsValue::from_str("init: gpu slot poisoned"));
+        };
+        *slot = Some(Gpu {
             surface,
             pipeline,
             ubuf,
@@ -144,7 +151,9 @@ impl DividerSheen {
         ab: f32,
         aa: f32,
     ) {
-        let mut s = self.state.borrow_mut();
+        let Ok(mut s) = self.state.try_borrow_mut() else {
+            return;
+        };
 
         s.border = [br, bg, bb, ba];
         s.accent = [ar, ag, ab, aa];
@@ -159,7 +168,9 @@ impl DividerSheen {
     ///
     /// @param w @param h Backing size in device pixels.
     pub fn resize(&self, w: f32, h: f32) {
-        self.state.borrow_mut().dev = [w, h];
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.dev = [w, h];
+        }
     }
 
     /// `frame` — advance the sweep clock, repack, draw.
@@ -167,7 +178,9 @@ impl DividerSheen {
     /// @param dt Frame delta in seconds.
     /// @returns false once the surface is stale/lost.
     pub fn frame(&self, dt: f32) -> bool {
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return false;
+        };
 
         let Some(g) = gpu.as_ref() else {
             return false;
@@ -177,7 +190,9 @@ impl DividerSheen {
 
         self.clock.set(t);
 
-        let s = self.state.borrow();
+        let Ok(s) = self.state.try_borrow() else {
+            return false;
+        };
         let mut u = [0.0f32; UNIFORM_F32S];
 
         u[0] = s.dev[0];
@@ -197,6 +212,15 @@ impl DividerSheen {
 }
 
 /// `destroy` parity — the struct drop releases the device refs.
+/// `destroy` parity — forget the GPU state instead of destructing
+/// it: the FinalizationRegistry's `__wbg_*_free` walks every stored
+/// JsValue's externref dealloc — on a torn-down table that traps
+/// `memory access out of bounds` during GC. GPU objects die with the
+/// shared device; leaking the handles is safe and un-panickable.
 impl Drop for DividerSheen {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        if let Some(g) = self.gpu.get_mut().take() {
+            std::mem::forget(g);
+        }
+    }
 }

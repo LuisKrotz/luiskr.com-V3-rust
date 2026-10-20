@@ -217,8 +217,16 @@ pub fn ring(inner_radius: f32, outer_radius: f32, segments: u32) -> Geometry {
         let (st, ct) = theta.sin_cos();
         let u = k as f32 / seg as f32;
 
-        g.push_vertex(Vec3::new(inner_radius * ct, inner_radius * st, 0.0), n, [u, 0.0]);
-        g.push_vertex(Vec3::new(outer_radius * ct, outer_radius * st, 0.0), n, [u, 1.0]);
+        g.push_vertex(
+            Vec3::new(inner_radius * ct, inner_radius * st, 0.0),
+            n,
+            [u, 0.0],
+        );
+        g.push_vertex(
+            Vec3::new(outer_radius * ct, outer_radius * st, 0.0),
+            n,
+            [u, 1.0],
+        );
     }
 
     // Pair k = (2k inner, 2k+1 outer). Cell (k,k+1):
@@ -327,7 +335,12 @@ pub fn box_mesh(w: f32, h: f32, d: f32) -> Geometry {
 /// @param height Full y extent.
 /// @param radial_segments Edges around (≥3).
 /// @returns Indexed open-ended tube mesh.
-pub fn cylinder(radius_top: f32, radius_bottom: f32, height: f32, radial_segments: u32) -> Geometry {
+pub fn cylinder(
+    radius_top: f32,
+    radius_bottom: f32,
+    height: f32,
+    radial_segments: u32,
+) -> Geometry {
     let seg = radial_segments.max(3) as usize;
     let mut g = Geometry::default();
     // Meridian slope — vertical rise per unit radial run (see doc).
@@ -392,17 +405,42 @@ pub fn icosahedron(radius: f32, detail: u32) -> Geometry {
 
     // The 12 corner directions of the three golden rectangles.
     let base: [[f32; 3]; 12] = [
-        [0.0, 1.0, PHI], [0.0, -1.0, PHI], [0.0, 1.0, -PHI], [0.0, -1.0, -PHI],
-        [1.0, PHI, 0.0], [-1.0, PHI, 0.0], [1.0, -PHI, 0.0], [-1.0, -PHI, 0.0],
-        [PHI, 0.0, 1.0], [-PHI, 0.0, 1.0], [PHI, 0.0, -1.0], [-PHI, 0.0, -1.0],
+        [0.0, 1.0, PHI],
+        [0.0, -1.0, PHI],
+        [0.0, 1.0, -PHI],
+        [0.0, -1.0, -PHI],
+        [1.0, PHI, 0.0],
+        [-1.0, PHI, 0.0],
+        [1.0, -PHI, 0.0],
+        [-1.0, -PHI, 0.0],
+        [PHI, 0.0, 1.0],
+        [-PHI, 0.0, 1.0],
+        [PHI, 0.0, -1.0],
+        [-PHI, 0.0, -1.0],
     ];
 
     // The 20 faces — index triplets chosen CCW-outward.
     let mut faces: Vec<[u32; 3]> = vec![
-        [0, 1, 8], [0, 8, 4], [0, 4, 5], [0, 5, 9], [0, 9, 1],
-        [1, 6, 8], [8, 6, 10], [8, 10, 4], [4, 10, 2], [4, 2, 5],
-        [5, 2, 11], [5, 11, 9], [9, 11, 7], [9, 7, 1], [1, 7, 6],
-        [6, 7, 3], [6, 3, 10], [10, 3, 2], [2, 3, 11], [11, 3, 7],
+        [0, 1, 8],
+        [0, 8, 4],
+        [0, 4, 5],
+        [0, 5, 9],
+        [0, 9, 1],
+        [1, 6, 8],
+        [8, 6, 10],
+        [8, 10, 4],
+        [4, 10, 2],
+        [4, 2, 5],
+        [5, 2, 11],
+        [5, 11, 9],
+        [9, 11, 7],
+        [9, 7, 1],
+        [1, 7, 6],
+        [6, 7, 3],
+        [6, 3, 10],
+        [10, 3, 2],
+        [2, 3, 11],
+        [11, 3, 7],
     ];
 
     // Base vertex table — projected to unit sphere for normals.

@@ -47,7 +47,7 @@
 
 use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
-use web_sys::{gpu_buffer_usage, HtmlCanvasElement};
+use web_sys::{gpu_buffer_usage, GpuDevice, HtmlCanvasElement};
 
 /// WGSL — corner-bracket shader.
 const WGSL: &str = include_str!("corner_brackets.wgsl");
@@ -117,25 +117,25 @@ impl CornerBrackets {
     /// `init` — device + pipeline + uniform bind group.
     ///
     /// @param canvas The overlay canvas (the button's own box).
+    /// @param device The shared GPUDevice (one per page, from the JS bridge).
     /// @returns Ok on a live surface, Err(JsValue) on failure.
-    pub async fn init(&self, canvas: HtmlCanvasElement) -> Result<(), JsValue> {
-        let surface = gpu_mini::init_surface(&canvas).await?;
+    pub fn init(&self, canvas: HtmlCanvasElement, device: GpuDevice) -> Result<(), JsValue> {
+        let surface = gpu_mini::init_surface(&canvas, &device)?;
 
-        let layout =
-            gpu_mini::new_layout(&surface.device, &[gpu_mini::uniform_entry(0)]);
+        let layout = gpu_mini::new_layout(&surface.device, &[gpu_mini::uniform_entry(0)])?;
 
         let pipeline = gpu_mini::fullscreen_pipeline(
             &surface.device,
             surface.format,
             WGSL,
             &[layout.clone()],
-        );
+        )?;
 
         let ubuf = gpu_mini::new_buffer(
             &surface.device,
             (UNIFORM_F32S * 4) as u32,
             gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST,
-        );
+        )?;
 
         let bind = gpu_mini::new_bind_group(
             &surface.device,
@@ -143,7 +143,13 @@ impl CornerBrackets {
             &[gpu_mini::bind_buffer_entry(0, &ubuf)],
         );
 
-        *self.gpu.borrow_mut() = Some(Gpu {
+        // try_borrow everywhere: a JS exception crossing a wasm frame
+        // mid-call leaks the RefCell guard — a later borrow() panics
+        // `unreachable` (the observed widget-crash cascade).
+        let Ok(mut slot) = self.gpu.try_borrow_mut() else {
+            return Err(JsValue::from_str("init: gpu slot poisoned"));
+        };
+        *slot = Some(Gpu {
             surface,
             pipeline,
             ubuf,
@@ -159,7 +165,9 @@ impl CornerBrackets {
     ///
     /// @param v Eased progress 0..1 (0 = stub arms, 1 = full span).
     pub fn set_hover(&self, v: f32) {
-        self.state.borrow_mut().hover = v.clamp(0.0, 1.0);
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.hover = v.clamp(0.0, 1.0);
+        }
     }
 
     /// `set_arms` — push the stub/full arm lengths and hairline (all
@@ -169,7 +177,9 @@ impl CornerBrackets {
     /// @param a1w @param a1h Full arm lengths.
     /// @param hair Hairline half-width in device px.
     pub fn set_arms(&self, a0w: f32, a0h: f32, a1w: f32, a1h: f32, hair: f32) {
-        let mut s = self.state.borrow_mut();
+        let Ok(mut s) = self.state.try_borrow_mut() else {
+            return;
+        };
 
         s.arm0 = [a0w, a0h];
         s.arm1 = [a1w, a1h];
@@ -192,7 +202,9 @@ impl CornerBrackets {
         ab: f32,
         aa: f32,
     ) {
-        let mut s = self.state.borrow_mut();
+        let Ok(mut s) = self.state.try_borrow_mut() else {
+            return;
+        };
 
         s.edge = [er, eg, eb, ea];
         s.accent = [ar, ag, ab, aa];
@@ -207,7 +219,9 @@ impl CornerBrackets {
     ///
     /// @param w @param h Backing size in device pixels.
     pub fn resize(&self, w: f32, h: f32) {
-        self.state.borrow_mut().dev = [w, h];
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.dev = [w, h];
+        }
     }
 
     /// `frame` — repack the uniform block, draw the brackets.
@@ -217,13 +231,17 @@ impl CornerBrackets {
     ///            the uniform).
     /// @returns false once the surface is stale/lost.
     pub fn frame(&self, _dt: f32) -> bool {
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return false;
+        };
 
         let Some(g) = gpu.as_ref() else {
             return false;
         };
 
-        let s = self.state.borrow();
+        let Ok(s) = self.state.try_borrow() else {
+            return false;
+        };
         let mut u = [0.0f32; UNIFORM_F32S];
 
         u[0] = s.dev[0];
@@ -244,6 +262,15 @@ impl CornerBrackets {
 }
 
 /// `destroy` parity — the struct drop releases the device refs.
+/// `destroy` parity — forget the GPU state instead of destructing
+/// it: the FinalizationRegistry's `__wbg_*_free` walks every stored
+/// JsValue's externref dealloc — on a torn-down table that traps
+/// `memory access out of bounds` during GC. GPU objects die with the
+/// shared device; leaking the handles is safe and un-panickable.
 impl Drop for CornerBrackets {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        if let Some(g) = self.gpu.get_mut().take() {
+            std::mem::forget(g);
+        }
+    }
 }

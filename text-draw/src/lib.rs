@@ -14,8 +14,11 @@
 //!   offset + i·char-delay + word cascade folded in), duration.
 //! - The vertex shader synthesizes each char's quad from
 //!   vertex_index+instance_index against the storage sheet — no
-//!   vertex buffer — applies the eased opacity + translateY per char,
-//!   and the fragment stage samples the atlas × ink color.
+//!   vertex buffer — applies the eased rise + a settling hand tremor,
+//!   and the fragment stage reveals the atlas pixels through a
+//!   wobbled stroke-direction mask so every letter reads as drawn by
+//!   a pen, not faded in (see text_draw.wgsl's header for the mask
+//!   math; delays/durations are the unchanged CSS values).
 //!
 //! The DOM text stays mounted (aria-hidden char spans + the real
 //! text sibling) — indexability, screen readers, and reader mode are
@@ -57,7 +60,7 @@
 
 use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
-use web_sys::{gpu_buffer_usage, HtmlCanvasElement};
+use web_sys::{gpu_buffer_usage, GpuDevice, HtmlCanvasElement};
 
 /// WGSL — instanced char-quad shader.
 const WGSL: &str = include_str!("text_draw.wgsl");
@@ -140,45 +143,37 @@ impl TextDraw {
     /// → `rebind`).
     ///
     /// @param canvas The overlay canvas.
+    /// @param device The shared GPUDevice (one per page, from the JS bridge).
     /// @returns Ok on a live surface, Err(JsValue) on failure.
-    pub async fn init(&self, canvas: HtmlCanvasElement) -> Result<(), JsValue> {
-        let surface = gpu_mini::init_surface(&canvas).await?;
+    pub fn init(&self, canvas: HtmlCanvasElement, device: GpuDevice) -> Result<(), JsValue> {
+        let surface = gpu_mini::init_surface(&canvas, &device)?;
 
-        // binding 0 uniform · 1 sheet (VERTEX+FRAGMENT — the vertex
-        // stage reads the rects) · 2 atlas · 3 sampler. gpu-mini's
-        // storage_entry is fragment-only; this widget needs the sheet
-        // in vs, so the entry is built inline.
-        let sheet_entry = web_sys::GpuBindGroupLayoutEntry::new(
-            1,
-            web_sys::gpu_shader_stage::VERTEX | web_sys::gpu_shader_stage::FRAGMENT,
-        );
-        let sheet_layout = web_sys::GpuBufferBindingLayout::new();
-        sheet_layout.set_type(web_sys::GpuBufferBindingType::ReadOnlyStorage);
-        sheet_layout.set_has_dynamic_offset(false);
-        sheet_entry.set_buffer(&sheet_layout);
-
+        // binding 0 uniform · 1 sheet · 2 atlas · 3 sampler — the
+        // vertex stage reads the uniform (res/time) and the char
+        // sheet (gpu-mini's entries are VERTEX+FRAGMENT for exactly
+        // this reason).
         let layout = gpu_mini::new_layout(
             &surface.device,
             &[
                 gpu_mini::uniform_entry(0),
-                sheet_entry,
+                gpu_mini::storage_entry(1),
                 gpu_mini::texture_entry(2),
                 gpu_mini::sampler_entry(3),
             ],
-        );
+        )?;
 
         let pipeline = gpu_mini::fullscreen_pipeline(
             &surface.device,
             surface.format,
             WGSL,
             &[layout.clone()],
-        );
+        )?;
 
         let ubuf = gpu_mini::new_buffer(
             &surface.device,
             (UNIFORM_F32S * 4) as u32,
             gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST,
-        );
+        )?;
 
         // Initial sheet: capacity for one char — `set_chars` recreates
         // on growth (sheets are written once per trigger, so the
@@ -187,11 +182,17 @@ impl TextDraw {
             &surface.device,
             (CHAR_F32S * 4) as u32,
             gpu_buffer_usage::STORAGE | gpu_buffer_usage::COPY_DST,
-        );
+        )?;
 
         let sampler = gpu_mini::linear_sampler(&surface.device);
 
-        *self.gpu.borrow_mut() = Some(Gpu {
+        // try_borrow everywhere below: a JS exception that crossed a
+        // wasm frame mid-call leaks the RefCell guard (wasm has no
+        // unwinding) — a later borrow() then panics `unreachable`.
+        let Ok(mut slot) = self.gpu.try_borrow_mut() else {
+            return Err(JsValue::from_str("init: gpu slot poisoned"));
+        };
+        *slot = Some(Gpu {
             surface,
             pipeline,
             ubuf,
@@ -213,21 +214,31 @@ impl TextDraw {
     /// @param bitmap The decoded atlas bitmap.
     /// @returns true when the texture landed, false before init.
     pub fn upload_atlas(&self, bitmap: &web_sys::ImageBitmap) -> bool {
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return false;
+        };
 
         let Some(g) = gpu.as_ref() else {
             return false;
         };
 
-        let tex = gpu_mini::bitmap_texture(
+        // A device fault reports false — the JS arm keeps the DOM
+        // text visible instead of a wasm panic inside the callback.
+        let Ok(tex) = gpu_mini::bitmap_texture(
             &g.surface.device,
             &g.surface.queue,
             bitmap,
             bitmap.width(),
             bitmap.height(),
-        );
+        ) else {
+            return false;
+        };
 
-        *g.tex.borrow_mut() = Some(tex);
+        let Ok(mut t) = g.tex.try_borrow_mut() else {
+            return false;
+        };
+        *t = Some(tex);
+        drop(t);
 
         self.rebind(g);
 
@@ -241,7 +252,9 @@ impl TextDraw {
     /// @param values The flat f32 sheet (len = count·12).
     /// @returns The char count adopted (0 on malformed input).
     pub fn set_chars(&self, values: &[f32]) -> u32 {
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return 0;
+        };
 
         let Some(g) = gpu.as_ref() else {
             return 0;
@@ -249,29 +262,47 @@ impl TextDraw {
 
         let count = (values.len() / CHAR_F32S) as u32;
 
-        self.state.borrow_mut().count = count;
+        let Ok(mut s) = self.state.try_borrow_mut() else {
+            return 0;
+        };
+        s.count = count;
+        drop(s);
 
         if count == 0 {
             return 0;
         }
 
         if count > g.sheet_cap.get() {
-            *g.sheet.borrow_mut() = gpu_mini::new_buffer(
+            // A device fault mid-regrow keeps the old sheet — 0 tells
+            // the JS arm the sheet wasn't adopted rather than a wasm
+            // panic inside the set_chars callback.
+            let Ok(sheet) = gpu_mini::new_buffer(
                 &g.surface.device,
                 (values.len() * 4) as u32,
                 gpu_buffer_usage::STORAGE | gpu_buffer_usage::COPY_DST,
-            );
+            ) else {
+                return 0;
+            };
 
+            let Ok(mut sh) = g.sheet.try_borrow_mut() else {
+                return 0;
+            };
+            *sh = sheet;
+            drop(sh);
             g.sheet_cap.set(count);
         }
 
+        let Ok(sheet_ref) = g.sheet.try_borrow() else {
+            return 0;
+        };
         let _ = g.surface.queue.write_buffer_with_u32_and_u8_slice(
-            &g.sheet.borrow(),
+            &sheet_ref,
             0,
             gpu_mini::f32_bytes(values),
         );
+        drop(sheet_ref);
 
-        if g.tex.borrow().is_some() {
+        if g.tex.try_borrow().map_or(false, |t| t.is_some()) {
             self.rebind(g);
         }
 
@@ -282,13 +313,17 @@ impl TextDraw {
     ///
     /// @param r @param g @param b @param a rgba 0-1.
     pub fn set_ink(&self, r: f32, g: f32, b: f32, a: f32) {
-        self.state.borrow_mut().ink = [r, g, b, a];
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.ink = [r, g, b, a];
+        }
     }
 
     /// `trigger` — start the stagger: the clock's current value
     /// becomes t0 so `frame` reports elapsed ms from HERE.
     pub fn trigger(&self) {
-        self.state.borrow_mut().t0_ms = self.clock.get() * 1000.0;
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.t0_ms = self.clock.get() * 1000.0;
+        }
     }
 
     /// `set_size` — CSS px (contract parity; unused — device px only).
@@ -300,16 +335,40 @@ impl TextDraw {
     ///
     /// @param w @param h Backing size in device pixels.
     pub fn resize(&self, w: f32, h: f32) {
-        self.state.borrow_mut().dev = [w, h];
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.dev = [w, h];
+        }
+
+        // Canvas-bitmap change → the context must re-configure or the
+        // next get_current_texture lands on the stale-size (or zero-
+        // size, when init ran before the overlay was laid out) surface
+        // — every frame after resize drew into an invalid texture.
+        if let Ok(gpu) = self.gpu.try_borrow() {
+            if let Some(g) = gpu.as_ref() {
+                gpu_mini::resize(&g.surface);
+            }
+        }
     }
 
     /// `rebind` — rebuild the bind group after a sheet/atlas swap.
     /// Bind groups are immutable by spec — resource swaps mean a new
     /// group, cheap at trigger-time (never mid-frame).
     fn rebind(&self, g: &Gpu) {
-        let tex = g.tex.borrow();
+        let Ok(tex) = g.tex.try_borrow() else {
+            return;
+        };
 
         let Some(t) = tex.as_ref() else {
+            return;
+        };
+
+        // A device fault skips the rebind — the previous group keeps
+        // drawing rather than a wasm panic inside the callback.
+        let Ok(v) = gpu_mini::view(t) else {
+            return;
+        };
+
+        let Ok(sheet_ref) = g.sheet.try_borrow() else {
             return;
         };
 
@@ -318,13 +377,17 @@ impl TextDraw {
             &g.layout,
             &[
                 gpu_mini::bind_buffer_entry(0, &g.ubuf),
-                gpu_mini::bind_buffer_entry(1, &g.sheet.borrow()),
-                gpu_mini::bind_view_entry(2, &gpu_mini::view(t)),
+                gpu_mini::bind_buffer_entry(1, &sheet_ref),
+                gpu_mini::bind_view_entry(2, &v),
                 gpu_mini::bind_sampler_entry(3, &g.sampler),
             ],
         );
+        drop(sheet_ref);
+        drop(tex);
 
-        *g.bind.borrow_mut() = Some(bind);
+        if let Ok(mut b) = g.bind.try_borrow_mut() {
+            *b = Some(bind);
+        }
     }
 
     /// `frame` — advance the clock, repack, draw all live chars.
@@ -332,13 +395,17 @@ impl TextDraw {
     /// @param dt Frame delta in seconds.
     /// @returns false once the surface is stale/lost (JS disarms).
     pub fn frame(&self, dt: f32) -> bool {
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return false;
+        };
 
         let Some(g) = gpu.as_ref() else {
             return false;
         };
 
-        let bind = g.bind.borrow();
+        let Ok(bind) = g.bind.try_borrow() else {
+            return false;
+        };
 
         let Some(b) = bind.as_ref() else {
             return false;
@@ -348,7 +415,9 @@ impl TextDraw {
 
         self.clock.set(t);
 
-        let s = self.state.borrow();
+        let Ok(s) = self.state.try_borrow() else {
+            return false;
+        };
         let mut u = [0.0f32; UNIFORM_F32S];
 
         u[0] = s.dev[0];
@@ -367,7 +436,16 @@ impl TextDraw {
     }
 }
 
-/// `destroy` parity — the struct drop releases the device refs.
+/// `destroy` parity — forget the GPU state instead of destructing
+/// it: the FinalizationRegistry's `__wbg_textdraw_free` would walk
+/// every stored JsValue's externref dealloc — on a torn-down table
+/// that traps `memory access out of bounds` during GC (the observed
+/// `TextDrawFinalization` crash). GPU objects die with the shared
+/// device; leaking the handles is safe and un-panickable.
 impl Drop for TextDraw {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        if let Some(g) = self.gpu.get_mut().take() {
+            std::mem::forget(g);
+        }
+    }
 }

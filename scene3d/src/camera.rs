@@ -125,9 +125,18 @@ impl Camera {
         self.apply_orbit();
 
         // Inverse rotation: the conjugate quaternion (negate xyz).
-        let qi = Quat::new(-self.rotation.x, -self.rotation.y, -self.rotation.z, self.rotation.w);
+        let qi = Quat::new(
+            -self.rotation.x,
+            -self.rotation.y,
+            -self.rotation.z,
+            self.rotation.w,
+        );
         let rot = qi.to_mat4();
-        let tra = Mat4::translation(Vec3::new(-self.position.x, -self.position.y, -self.position.z));
+        let tra = Mat4::translation(Vec3::new(
+            -self.position.x,
+            -self.position.y,
+            -self.position.z,
+        ));
 
         rot.mul(tra)
     }

@@ -111,7 +111,11 @@ fn scan_autolinks(text: &str) -> Vec<Autolink> {
 
                 // Trailing-punctuation trim — `,;:.!?'"*` can't end a
                 // URL in the loose autolink form.
-                while end > i && matches!(bytes[end - 1], b',' | b';' | b':' | b'.' | b'!' | b'?' | b'*')
+                while end > i
+                    && matches!(
+                        bytes[end - 1],
+                        b',' | b';' | b':' | b'.' | b'!' | b'?' | b'*'
+                    )
                 {
                     end -= 1;
                 }

@@ -93,7 +93,10 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // min(res) normalization keeps the field isotropic (circles stay
     // circles) on any viewport aspect.
     let res = vec2<f32>(u.rect.z, u.rect.w);
-    let p = (vec2<f32>(frag.x - u.rect.x, frag.y - u.rect.y) - 0.5 * res) / min(res.x, res.y);
+    // y is flipped: WGSL `frag` is framebuffer-origin (y=0 TOP) but the
+    // ported GLSL used gl_FragCoord (y=0 BOTTOM) — without the flip the
+    // warp drift and reveal wipe directions run mirrored.
+    let p = (vec2<f32>(frag.x - u.rect.x, u.rect.w - (frag.y - u.rect.y)) - 0.5 * res) / min(res.x, res.y);
     let t = u.time * 0.018;
 
     // ── Double domain-warp (the "why it looks like fabric") ──────────

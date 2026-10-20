@@ -47,9 +47,12 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
 
 @fragment
 fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    // uv.y flipped: WGSL `frag` is framebuffer-origin (y=0 TOP) while
+    // the ported GLSL used v_uv/gl_FragCoord (y=0 BOTTOM) — the fill
+    // sweep direction and lighting terms assume bottom-origin.
     let uv = vec2<f32>(
         (frag.x - u.rect.x) / u.rect.z,
-        (frag.y - u.rect.y) / u.rect.w,
+        1.0 - (frag.y - u.rect.y) / u.rect.w,
     );
     let pixel = uv * u.res;
     let center = u.res * 0.5;

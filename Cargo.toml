@@ -24,7 +24,7 @@
 resolver = "2"
 members = [
   "burn","burger","close-button","corner-brackets","diagram","divider-sheen",
-  "flag","glitch","gpu-mini","markdown","media","menu-background","ring-sheen","scene3d",
+  "flag","genie","glitch","gpu-mini","markdown","media","menu-background","ring-sheen","scene3d",
   "skeleton","switch-slider","text-draw","theme-slider",
 ]
 

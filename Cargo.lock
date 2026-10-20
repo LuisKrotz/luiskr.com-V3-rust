@@ -147,6 +147,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "luiskr-genie"
+version = "0.1.0"
+dependencies = [
+ "gpu-mini",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "luiskr-glitch"
 version = "0.1.0"
 dependencies = [

@@ -43,13 +43,7 @@ pub fn label_size(lines: &[String], theme: &Theme) -> (f32, f32) {
 /// `<text>` block for a possibly multi-line label, centered at (cx, cy).
 /// Each line is a `<tspan>` stacked `LINE_H` em apart — the same shape
 /// mermaid emits, so the existing docs CSS keeps styling it.
-pub fn centered_text(
-    out: &mut String,
-    cx: f32,
-    cy: f32,
-    lines: &[String],
-    theme: &Theme,
-) {
+pub fn centered_text(out: &mut String, cx: f32, cy: f32, lines: &[String], theme: &Theme) {
     let lh = theme.font_size * LINE_H;
     // First baseline: center the block — total height (n-1)·lh, so the
     // first line sits half the stack above center plus one baseline's
@@ -90,7 +84,11 @@ pub fn edge_line(
     thick: bool,
     theme: &Theme,
 ) {
-    let dash = if dashed { r#" stroke-dasharray="5,4""# } else { "" };
+    let dash = if dashed {
+        r#" stroke-dasharray="5,4""#
+    } else {
+        ""
+    };
     let w = if thick { 2.4 } else { 1.4 };
 
     out.push_str(&format!(
@@ -124,13 +122,7 @@ pub fn arrow_head(out: &mut String, x2: f32, y2: f32, dx: f32, dy: f32, theme: &
 
 /// A small rounded chip behind an edge label — keeps text readable
 /// where the line passes beneath it (the surface color masks the line).
-pub fn label_chip(
-    out: &mut String,
-    cx: f32,
-    cy: f32,
-    lines: &[String],
-    theme: &Theme,
-) {
+pub fn label_chip(out: &mut String, cx: f32, cy: f32, lines: &[String], theme: &Theme) {
     let (w, h) = label_size(lines, theme);
 
     out.push_str(&format!(
@@ -143,9 +135,12 @@ pub fn label_chip(
     centered_text(out, cx, cy, lines, theme);
 }
 
-/// Opens the `<svg>` element with a 1:1 viewBox.
-pub fn open(out: &mut String, w: f32, h: f32) {
+/// Opens the `<svg>` element with a 1:1 viewBox that may start at a
+/// negative origin — callers pass the true painted bounds (min corner +
+/// extents) so edge labels, self-loops and note bands that overshoot
+/// the node grid are not clipped by the viewBox.
+pub fn open(out: &mut String, min_x: f32, min_y: f32, w: f32, h: f32) {
     out.push_str(&format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" role="img">"##,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{min_x:.0} {min_y:.0} {w:.0} {h:.0}" width="{w:.0}" role="img">"##,
     ));
 }

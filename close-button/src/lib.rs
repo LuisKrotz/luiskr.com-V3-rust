@@ -23,7 +23,7 @@
 
 use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
-use web_sys::HtmlCanvasElement;
+use web_sys::{GpuDevice, HtmlCanvasElement};
 
 /// WGSL — liquid-fill circular close button.
 const WGSL: &str = include_str!("close_button.wgsl");
@@ -82,9 +82,21 @@ impl CloseButton {
     /// button; mounting can never regress the page.
     ///
     /// @param canvas The widget's dedicated canvas.
+    /// @param device The shared GPUDevice (one per page, from the JS bridge).
     /// @returns Ok on a live surface, Err(JsValue) on failure.
-    pub async fn init(&self, canvas: HtmlCanvasElement) -> Result<(), JsValue> {
-        *self.gpu.borrow_mut() = Some(gpu_mini::init_widget(&canvas, WGSL).await?);
+    pub fn init(&self, canvas: HtmlCanvasElement, device: GpuDevice) -> Result<(), JsValue> {
+        // try_borrow everywhere: a JS exception crossing a wasm frame
+        // mid-call leaks the RefCell guard — a later borrow() panics
+        // `unreachable` (the observed widget-crash cascade). Build the
+        // GPU state BEFORE taking the guard so the fallible JS-boundary
+        // calls can never run while the borrow is held.
+        let built = gpu_mini::init_widget(&canvas, &device, WGSL)?;
+
+        let Ok(mut slot) = self.gpu.try_borrow_mut() else {
+            return Err(JsValue::from_str("init: gpu slot poisoned"));
+        };
+
+        *slot = Some(built);
         Ok(())
     }
 
@@ -93,9 +105,13 @@ impl CloseButton {
     /// @param _w Device-pixel width (element-side).
     /// @param _h Device-pixel height.
     pub fn resize(&self, w: u32, h: u32) {
-        self.state.borrow_mut().dev = [(w.max(1)) as f32, (h.max(1)) as f32];
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.dev = [(w.max(1)) as f32, (h.max(1)) as f32];
+        }
 
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return;
+        };
 
         if let Some(w) = gpu.as_ref() {
             gpu_mini::resize(&w.surface);
@@ -107,7 +123,9 @@ impl CloseButton {
     /// @param w Canvas width in CSS pixels.
     /// @param h Canvas height in CSS pixels.
     pub fn set_size(&self, w: f32, h: f32) {
-        self.state.borrow_mut().css = [w.max(1.0), h.max(1.0)];
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.css = [w.max(1.0), h.max(1.0)];
+        }
     }
 
     /// `set_state` — bundled scalar update: liquid fill, X stroke
@@ -117,7 +135,9 @@ impl CloseButton {
     /// @param draw 0..1 X stroke progress.
     /// @param rot X rotation in radians.
     pub fn set_state(&self, liquid: f32, draw: f32, rot: f32) {
-        let mut s = self.state.borrow_mut();
+        let Ok(mut s) = self.state.try_borrow_mut() else {
+            return;
+        };
 
         s.liquid = liquid.clamp(0.0, 1.0);
         s.draw = draw.clamp(0.0, 1.0);
@@ -130,14 +150,18 @@ impl CloseButton {
     ///
     /// @param time The frame clock's current seconds.
     pub fn click(&self, time: f32) {
-        self.state.borrow_mut().click_time = time;
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.click_time = time;
+        }
     }
 
     /// `frame` — one animation tick: pack, write, draw.
     ///
     /// @param dt Seconds since the previous call.
     pub fn frame(&self, dt: f32) {
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return;
+        };
 
         let Some(w) = gpu.as_ref() else {
             return;
@@ -145,7 +169,9 @@ impl CloseButton {
 
         self.clock.set(self.clock.get() + dt);
 
-        let s = self.state.borrow();
+        let Ok(s) = self.state.try_borrow() else {
+            return;
+        };
 
         // [0,1] res [2] time [3] liquid [4] draw [5] rot
         // [6] click_time [7] pad [8..11] rect = (0,0,w,h)
@@ -168,6 +194,19 @@ impl CloseButton {
 
         if !gpu_mini::widget_frame(w, &uniforms) {
             gpu_mini::resize(&w.surface);
+        }
+    }
+}
+
+/// `destroy` parity — forget the GPU state instead of destructing
+/// it: the FinalizationRegistry's `__wbg_*_free` walks every stored
+/// JsValue's externref dealloc — on a torn-down table that traps
+/// `memory access out of bounds` during GC. GPU objects die with the
+/// shared device; leaking the handles is safe and un-panickable.
+impl Drop for CloseButton {
+    fn drop(&mut self) {
+        if let Some(g) = self.gpu.get_mut().take() {
+            std::mem::forget(g);
         }
     }
 }

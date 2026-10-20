@@ -89,7 +89,13 @@ fn vs_main(v : VertexIn) -> VertexOut {
 /// clouds must not write transparent depth.
 @fragment
 fn fs_main(v : VertexOut) -> @location(0) vec4<f32> {
+    // Sample BEFORE the discard — implicit-derivative calls must sit
+    // in unconditionally-uniform control flow; a post-discard call is
+    // legal on most validators but demote-after-sample ordering is
+    // universally safe and identical in output (the discarded
+    // fragment never presents).
     let r = length(v.corner);
+    let texel = textureSample(tex, smp, v.corner * 0.5 + vec2<f32>(0.5));
 
     if (r > 1.0) {
         discard;
@@ -99,7 +105,6 @@ fn fs_main(v : VertexOut) -> @location(0) vec4<f32> {
     // wide enough to hide the quad edge at point sizes ≥4px, narrow
     // enough that small points stay solid.
     let alpha = 1.0 - smoothstep(0.8, 1.0, r);
-    let texel = textureSample(tex, smp, v.corner * 0.5 + vec2<f32>(0.5));
 
     return (texel * frame.mat_color + frame.mat_emit) * alpha;
 }

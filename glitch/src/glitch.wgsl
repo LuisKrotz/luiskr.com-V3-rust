@@ -111,13 +111,14 @@ fn fs_main(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {
     // 1 ── Circle clip: the portrait is a circle inscribed in the
     // square viewport centered on the canvas — outside → transparent
     // (the canvas composites over the DOM <img> unchanged there).
+    // Mask, NOT an early return: a fragment-dependent `return` makes
+    // every later control-flow node non-uniform, and textureSample's
+    // implicit derivatives are only legal in uniform flow (Dawn:
+    // "'textureSample' must only be called from uniform control flow").
     let size   = min(u.res.x, u.res.y);
     let center = u.res * 0.5;
     let radius = size * 0.5;
-
-    if (distance(frag.xy, center) > radius) {
-        return vec4<f32>(0.0);
-    }
+    let inside = select(0.0, 1.0, distance(frag.xy, center) <= radius);
 
     // frag→uv through the cover rect — identical to the DOM's
     // object-fit:cover + object-position mapping (coverRect()).
@@ -190,11 +191,16 @@ fn fs_main(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {
         let bh = ROLL_H;
         let y  = fract(u.time * ROLL_SPEED / 1.3) * (1.3 + bh) - bh;
 
+        // The torn-band sample runs unconditionally — textureSample
+        // inside the fragment-varying `if` below is non-uniform flow;
+        // sample first, gate the assignment.
+        let torn = textureSample(
+            tex, smp,
+            vec2<f32>(uv.x + (h(100u) - 0.5) * HOVER_TEAR, uv.y)
+        ) * 1.3;
+
         if (uv.y >= y && uv.y <= y + bh) {
-            col = textureSample(
-                tex, smp,
-                vec2<f32>(uv.x + (h(100u) - 0.5) * HOVER_TEAR, uv.y)
-            ) * 1.3;
+            col = torn;
         }
 
         // 6 ── trackBar (50% gate): thin bright strip at hashed y.
@@ -239,8 +245,11 @@ fn fs_main(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {
         col = vec4<f32>(mix(col.rgb, ink, ga), col.a);
     }
 
-    // Premultiplied out — the canvas alpha mode is premultiplied.
-    return vec4<f32>(col.rgb * col.a, col.a);
+    // Circle-clip mask + premultiplied out — `inside` is 0 outside the
+    // inscribed circle so the canvas composites transparent there.
+    let a = col.a * inside;
+
+    return vec4<f32>(col.rgb * a, a);
 }
 
 /// `vs_main` — the shared fullscreen triangle (gpu-mini contract:

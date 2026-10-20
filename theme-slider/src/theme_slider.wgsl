@@ -61,9 +61,14 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
 
 @fragment
 fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    // WGSL `frag` is framebuffer-origin (y=0 at TOP) while the ported
+    // GLSL math assumes v_uv semantics (y=0 at BOTTOM) — without the
+    // flip the whole scene renders upside-down: stars at the bottom,
+    // mesas at the top, sun rising from the floor, and the knob's
+    // 3D shading mirrored.
     let uv = vec2<f32>(
         (frag.x - u.rect.x) / u.rect.z,
-        (frag.y - u.rect.y) / u.rect.w,
+        1.0 - (frag.y - u.rect.y) / u.rect.w,
     );
 
     let aspect = u.res.x / u.res.y;

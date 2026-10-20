@@ -50,6 +50,7 @@ use crate::math::Vec3;
 use crate::scene::{Kind, NodeId, Scene};
 use gpu_mini::*;
 use std::collections::HashMap;
+use wasm_bindgen::JsValue;
 use web_sys::*;
 
 /// Frame-uniform block size in f32s — camera(48) + model(16) +
@@ -160,42 +161,42 @@ impl Renderer {
     ///
     /// @param surface The configured canvas surface.
     /// @param w @param h Initial backing size (device px).
-    /// @returns The ready renderer.
-    pub fn new(surface: Surface, w: u32, h: u32) -> Renderer {
+    /// @returns The ready renderer, or Err so `mount` rejects to the
+    ///   JS fallback instead of panicking inside the async future.
+    pub fn new(surface: Surface, w: u32, h: u32) -> Result<Renderer, JsValue> {
         let device = &surface.device;
         let queue = &surface.queue;
 
         // group(0): the frame uniform — VERTEX|FRAGMENT visibility
-        // (gpu-mini's uniform_entry is fragment-only; the scene reads
-        // view_proj in the vertex stage).
-        let frame_entry = GpuBindGroupLayoutEntry::new(0, gpu_shader_stage::VERTEX | gpu_shader_stage::FRAGMENT);
-        let frame_layout_inner = GpuBufferBindingLayout::new();
-        frame_layout_inner.set_type(GpuBufferBindingType::Uniform);
-        frame_layout_inner.set_has_dynamic_offset(false);
-        frame_entry.set_buffer(&frame_layout_inner);
-        let frame_layout = new_layout(device, &[frame_entry]);
+        // (the scene reads view_proj in the vertex stage — gpu-mini's
+        // uniform_entry is exactly that).
+        let frame_layout = new_layout(device, &[uniform_entry(0)])?;
 
         // group(1): {texture, sampler} — the per-material texture bind.
-        let tex_layout = new_layout(device, &[texture_entry(0), sampler_entry(1)]);
+        let tex_layout = new_layout(device, &[texture_entry(0), sampler_entry(1)])?;
 
         let frame_buf = new_buffer(
             device,
             (FRAME_F32S * 4) as u32,
             gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST,
-        );
-        let frame_group = new_bind_group(device, &frame_layout, &[bind_buffer_entry(0, &frame_buf)]);
+        )?;
+        let frame_group =
+            new_bind_group(device, &frame_layout, &[bind_buffer_entry(0, &frame_buf)]);
 
         let sampler = linear_sampler(device);
 
         // The 1×1 white texture — see module doc: untextured materials
         // bind this so tex·color == color, no pipeline variant needed.
-        let white = new_texture(device, 1, 1);
+        let white = new_texture(device, 1, 1)?;
         upload_rgba(queue, &white, 1, 1, &[255, 255, 255, 255]);
-        let white_view = view(&white);
+        let white_view = view(&white)?;
         let white_bind = new_bind_group(
             device,
             &tex_layout,
-            &[bind_view_entry(0, &white_view), bind_sampler_entry(1, &sampler)],
+            &[
+                bind_view_entry(0, &white_view),
+                bind_sampler_entry(1, &sampler),
+            ],
         );
 
         let mut r = Renderer {
@@ -232,10 +233,12 @@ impl Renderer {
         }
         quad.indices = QUAD_IDX.to_vec();
 
-        r.quad_geo = r.upload_geometry(&quad, false);
+        // A fault here leaves quad_geo = u32::MAX — sprite draws
+        // resolve to a registry miss and skip rather than panicking.
+        r.quad_geo = r.upload_geometry(&quad, false).unwrap_or(u32::MAX);
 
         r.resize(w, h);
-        r
+        Ok(r)
     }
 
     /// `resize` — backing-size change → depth target recreate +
@@ -253,7 +256,9 @@ impl Renderer {
 
         gpu_mini::resize(&self.surface);
 
-        let tex = self
+        // A device fault leaves `depth` empty — the next frame skips
+        // rather than panicking mid-rAF.
+        self.depth = self
             .surface
             .device
             .create_texture(&GpuTextureDescriptor::new(
@@ -265,9 +270,8 @@ impl Renderer {
                 ],
                 gpu_texture_usage::RENDER_ATTACHMENT,
             ))
-            .expect("depth texture");
-
-        self.depth = Some(view(&tex));
+            .ok()
+            .and_then(|t| view(&t).ok());
     }
 
     /// `upload_geometry` — pack a `Geometry` into interleaved vertex +
@@ -285,8 +289,10 @@ impl Renderer {
     /// @param g The CPU-side geometry.
     /// @param as_points True → expand each vertex into a billboard
     ///        quad (Points draw); false → plain indexed mesh.
-    /// @returns The geometry registry id.
-    pub fn upload_geometry(&mut self, g: &Geometry, as_points: bool) -> u32 {
+    /// @returns The geometry registry id, or None when a device fault
+    ///   blocked the buffer upload (callers pass u32::MAX to JS —
+    ///   frame-time lookups resolve to a registry miss and skip).
+    pub fn upload_geometry(&mut self, g: &Geometry, as_points: bool) -> Option<u32> {
         let (positions, normals, uvs, indices) = if as_points {
             expand_points(g)
         } else {
@@ -314,29 +320,32 @@ impl Renderer {
             interleaved[o + 7] = uvs[i * 2 + 1];
         }
 
-        let vertex = new_buffer(
-            &self.surface.device,
-            (interleaved.len() * 4) as u32,
-            gpu_buffer_usage::VERTEX | gpu_buffer_usage::COPY_DST,
-        );
-        let index = new_buffer(
-            &self.surface.device,
-            (indices.len() * 4) as u32,
-            gpu_buffer_usage::INDEX | gpu_buffer_usage::COPY_DST,
-        );
+        let (Ok(vertex), Ok(index)) = (
+            new_buffer(
+                &self.surface.device,
+                (interleaved.len() * 4) as u32,
+                gpu_buffer_usage::VERTEX | gpu_buffer_usage::COPY_DST,
+            ),
+            new_buffer(
+                &self.surface.device,
+                (indices.len() * 4) as u32,
+                gpu_buffer_usage::INDEX | gpu_buffer_usage::COPY_DST,
+            ),
+        ) else {
+            return None;
+        };
 
         let _ = self.surface.queue.write_buffer_with_u32_and_u8_slice(
             &vertex,
             0,
             f32_bytes(&interleaved),
         );
-        let _ = self.surface.queue.write_buffer_with_u32_and_u8_slice(
-            &index,
-            0,
-            unsafe {
+        let _ = self
+            .surface
+            .queue
+            .write_buffer_with_u32_and_u8_slice(&index, 0, unsafe {
                 std::slice::from_raw_parts(indices.as_ptr().cast::<u8>(), indices.len() * 4)
-            },
-        );
+            });
 
         self.geos.push(Geo {
             vertex,
@@ -344,7 +353,7 @@ impl Renderer {
             index_count: indices.len() as u32,
         });
 
-        (self.geos.len() - 1) as u32
+        Some((self.geos.len() - 1) as u32)
     }
 
     /// `upload_texture` — register a decoded bitmap as a texture
@@ -352,13 +361,21 @@ impl Renderer {
     ///
     /// @param bitmap The JS-decoded ImageBitmap.
     /// @param w @param h Bitmap size.
-    /// @returns The texture registry id.
-    pub fn upload_texture(&mut self, bitmap: &ImageBitmap, w: u32, h: u32) -> u32 {
-        let tex = bitmap_texture(&self.surface.device, &self.surface.queue, bitmap, w, h);
+    /// @returns The texture registry id, or None on a device fault —
+    ///   materials holding u32::MAX bind the white fallback.
+    pub fn upload_texture(&mut self, bitmap: &ImageBitmap, w: u32, h: u32) -> Option<u32> {
+        let Ok(tex) = bitmap_texture(&self.surface.device, &self.surface.queue, bitmap, w, h)
+        else {
+            return None;
+        };
 
-        self.texs.push(Tex { view: view(&tex) });
+        let Ok(v) = view(&tex) else {
+            return None;
+        };
 
-        (self.texs.len() - 1) as u32
+        self.texs.push(Tex { view: v });
+
+        Some((self.texs.len() - 1) as u32)
     }
 
     /// `add_material` — register a material record; builds its
@@ -425,10 +442,12 @@ impl Renderer {
     /// `pipe` — fetch-or-create the pipeline for (kind, side, blend).
     /// Lazily created and cached in `self.pipes` — pipeline creation
     /// compiles + validates a WGSL module (~ms), so it must never
-    /// happen mid-frame.
-    fn pipe(&mut self, key: PipeKey, kind: u8) -> GpuRenderPipeline {
+    /// happen mid-frame. Returns None when validation rejects the
+    /// descriptor — the draw is skipped rather than panicking inside
+    /// a frame callback.
+    fn pipe(&mut self, key: PipeKey, kind: u8) -> Option<GpuRenderPipeline> {
         if let Some(p) = self.pipes.get(&key) {
-            return p.clone();
+            return Some(p.clone());
         }
 
         let wgsl = match kind {
@@ -444,22 +463,22 @@ impl Renderer {
             _ => GpuCullMode::Back,
         };
         let additive = key.2 == 1;
-        let p = self.build_pipeline(wgsl, side, additive, kind == 4);
+        let p = self.build_pipeline(wgsl, side, additive, kind == 4)?;
 
         self.pipes.insert(key, p.clone());
-        p
+        Some(p)
     }
 
     /// `build_pipeline` — assemble one render pipeline: the shared
     /// two-group layout, the interleaved vertex layout, depth stencil,
-    /// cull + blend by key.
+    /// cull + blend by key. None on a device-side validation error.
     fn build_pipeline(
         &self,
         wgsl: &str,
         cull: GpuCullMode,
         additive: bool,
         instanced: bool,
-    ) -> GpuRenderPipeline {
+    ) -> Option<GpuRenderPipeline> {
         let device = &self.surface.device;
         let shader = device.create_shader_module(&GpuShaderModuleDescriptor::new(wgsl));
         let layout_arr = [
@@ -537,9 +556,7 @@ impl Renderer {
         desc.set_depth_stencil(&depth);
         desc.set_primitive(&prim);
 
-        device
-            .create_render_pipeline(&desc)
-            .expect("create_render_pipeline")
+        device.create_render_pipeline(&desc).ok()
     }
 
     /// `frame` — one full render: upload the camera block, walk the
@@ -583,16 +600,21 @@ impl Renderer {
         cam.write_frame_uniform(&mut block, w as f32, h as f32, dpr, time, light);
         write_f32s(&self.surface.queue, &self.frame_buf, &block);
 
-        let view = self
-            .surface
-            .context
-            .get_current_texture()
-            .expect("frame texture")
-            .create_view()
-            .expect("frame view");
-        let depth_att = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(
-            &self.depth.clone().unwrap(),
-        );
+        // Stale surface (resize mid-frame, occluded tab) → skip the
+        // frame; a missed tick beats a wasm panic inside the rAF
+        // callback, which would poison the glue closures for good.
+        let (Ok(tex), Some(depth_view)) = (
+            self.surface.context.get_current_texture(),
+            self.depth.clone(),
+        ) else {
+            return;
+        };
+
+        let Ok(view) = tex.create_view() else {
+            return;
+        };
+
+        let depth_att = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&depth_view);
         depth_att.set_depth_clear_value(1.0);
         depth_att.set_depth_load_op(GpuLoadOp::Clear);
         depth_att.set_depth_store_op(GpuStoreOp::Store);
@@ -602,12 +624,7 @@ impl Renderer {
             GpuStoreOp::Store,
             &view,
         );
-        let clear = GpuColorDict::new(
-            clear_rgba[0],
-            clear_rgba[1],
-            clear_rgba[2],
-            clear_rgba[3],
-        );
+        let clear = GpuColorDict::new(clear_rgba[0], clear_rgba[1], clear_rgba[2], clear_rgba[3]);
         color_att.set_clear_value_gpu_color_dict(&clear);
         let attachments = [js_sys::JsNullable::wrap(color_att)];
         let desc = GpuRenderPassDescriptor::new(&attachments);
@@ -617,7 +634,10 @@ impl Renderer {
             .surface
             .device
             .create_command_encoder_with_descriptor(&GpuCommandEncoderDescriptor::new());
-        let pass = encoder.begin_render_pass(&desc).expect("begin_render_pass");
+
+        let Ok(pass) = encoder.begin_render_pass(&desc) else {
+            return;
+        };
 
         // ── Draw dispatch ──────────────────────────────────────────
         // Opaque first (depth-sorted pipeline), then transparent —
@@ -682,44 +702,45 @@ impl Renderer {
 
                 if !version_hit && !node.instances.is_empty() {
                     let needed = node.instances.len() as u32;
-                    let entry = self.inst_bufs.entry(id.0).or_insert_with(|| {
-                        (
-                            new_buffer(
-                                &self.surface.device,
-                                needed * 64,
-                                gpu_buffer_usage::VERTEX | gpu_buffer_usage::COPY_DST,
-                            ),
-                            needed,
-                        )
-                    });
+                    let needs_alloc = self.inst_bufs.get(&id.0).map_or(true, |e| e.1 < needed);
 
-                    // Grow the buffer when the table outgrew capacity —
-                    // recreate rather than ring: instanced tables are
-                    // sized at init, growth is the exception.
-                    if entry.1 < needed {
-                        *entry = (
-                            new_buffer(
-                                &self.surface.device,
-                                needed * 64,
-                                gpu_buffer_usage::VERTEX | gpu_buffer_usage::COPY_DST,
-                            ),
-                            needed,
-                        );
+                    // Allocate only when absent or undersized — recreate
+                    // rather than ring: tables are sized at init, growth
+                    // is the exception. A device fault leaves the table
+                    // empty/stale — the instanced draw below resolves to
+                    // a registry miss and skips rather than a wasm panic
+                    // inside the rAF callback.
+                    if needs_alloc {
+                        if let Ok(inst_buf) = new_buffer(
+                            &self.surface.device,
+                            needed * 64,
+                            gpu_buffer_usage::VERTEX | gpu_buffer_usage::COPY_DST,
+                        ) {
+                            self.inst_bufs.insert(id.0, (inst_buf, needed));
+                        }
                     }
 
-                    self.inst_scratch.clear();
+                    // Capacity-gated: a stale undersized buffer (failed
+                    // regrow) skips the upload AND the version stamp —
+                    // the next frame retries rather than silently
+                    // clipping the instance table forever.
+                    if let Some(entry) = self.inst_bufs.get(&id.0) {
+                        if entry.1 >= needed {
+                            self.inst_scratch.clear();
 
-                    for m in node.instances.iter() {
-                        self.inst_scratch.extend_from_slice(&m.m);
+                            for m in node.instances.iter() {
+                                self.inst_scratch.extend_from_slice(&m.m);
+                            }
+
+                            let _ = self.surface.queue.write_buffer_with_u32_and_u8_slice(
+                                &entry.0,
+                                0,
+                                f32_bytes(&self.inst_scratch),
+                            );
+
+                            self.inst_versions.insert(id.0, node.inst_version);
+                        }
                     }
-
-                    let _ = self.surface.queue.write_buffer_with_u32_and_u8_slice(
-                        &entry.0,
-                        0,
-                        f32_bytes(&self.inst_scratch),
-                    );
-
-                    self.inst_versions.insert(id.0, node.inst_version);
                 }
             }
 
@@ -728,8 +749,14 @@ impl Renderer {
                 Side::Back => 1,
                 Side::Double => 2,
             };
-            let blend_idx = if record.flags.blending == Blending::Additive { 1 } else { 0 };
-            let pipe = self.pipe(PipeKey(kind, side_idx, blend_idx), kind);
+            let blend_idx = if record.flags.blending == Blending::Additive {
+                1
+            } else {
+                0
+            };
+            let Some(pipe) = self.pipe(PipeKey(kind, side_idx, blend_idx), kind) else {
+                continue;
+            };
 
             // Per-draw block: model at f32 offset 48, material at 64 —
             // byte offset 48·4 = 192 into the shared frame buffer, so
@@ -754,10 +781,7 @@ impl Renderer {
             if instanced {
                 if let Some((inst_buf, _)) = self.inst_bufs.get(&id.0) {
                     pass.set_vertex_buffer(1, Some(inst_buf));
-                    pass.draw_indexed_with_instance_count(
-                        geo_count,
-                        node.instances.len() as u32,
-                    );
+                    pass.draw_indexed_with_instance_count(geo_count, node.instances.len() as u32);
                 }
             } else {
                 pass.draw_indexed(geo_count);
@@ -796,7 +820,11 @@ fn expand_points(g: &Geometry) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u32>) {
     let mut ix = Vec::with_capacity(n * 6);
 
     for i in 0..n {
-        let (px, py, pz) = (g.positions[i * 3], g.positions[i * 3 + 1], g.positions[i * 3 + 2]);
+        let (px, py, pz) = (
+            g.positions[i * 3],
+            g.positions[i * 3 + 1],
+            g.positions[i * 3 + 2],
+        );
         let (nx, ny, nz) = (g.normals[i * 3], g.normals[i * 3 + 1], g.normals[i * 3 + 2]);
 
         for c in CORNERS.iter() {

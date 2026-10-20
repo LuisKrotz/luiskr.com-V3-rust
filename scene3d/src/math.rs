@@ -212,8 +212,7 @@ impl Mat4 {
 
         for c in 0..4 {
             for r in 0..4 {
-                out[c * 4 + r] = self.m[r]
-                    * o.m[c * 4]
+                out[c * 4 + r] = self.m[r] * o.m[c * 4]
                     + self.m[4 + r] * o.m[c * 4 + 1]
                     + self.m[8 + r] * o.m[c * 4 + 2]
                     + self.m[12 + r] * o.m[c * 4 + 3];

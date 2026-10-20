@@ -54,7 +54,7 @@
 
 use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
-use web_sys::{gpu_buffer_usage, HtmlCanvasElement};
+use web_sys::{gpu_buffer_usage, GpuDevice, HtmlCanvasElement};
 
 /// WGSL — instanced ring-sheen shader.
 const WGSL: &str = include_str!("ring_sheen.wgsl");
@@ -131,44 +131,37 @@ impl RingSheen {
     /// `init` — device + pipeline + the initial bind group.
     ///
     /// @param canvas The overlay canvas (positioned over the grid).
+    /// @param device The shared GPUDevice (one per page, from the JS bridge).
     /// @returns Ok on a live surface, Err(JsValue) on failure.
-    pub async fn init(&self, canvas: HtmlCanvasElement) -> Result<(), JsValue> {
-        let surface = gpu_mini::init_surface(&canvas).await?;
+    pub fn init(&self, canvas: HtmlCanvasElement, device: GpuDevice) -> Result<(), JsValue> {
+        let surface = gpu_mini::init_surface(&canvas, &device)?;
 
-        // binding 0 uniform · 1 tile sheet (VERTEX+FRAGMENT — vs reads
-        // the rects to place quads, fs reads them for the SDF ring).
-        let sheet_entry = web_sys::GpuBindGroupLayoutEntry::new(
-            1,
-            web_sys::gpu_shader_stage::VERTEX | web_sys::gpu_shader_stage::FRAGMENT,
-        );
-        let sheet_layout = web_sys::GpuBufferBindingLayout::new();
-        sheet_layout.set_type(web_sys::GpuBufferBindingType::ReadOnlyStorage);
-        sheet_layout.set_has_dynamic_offset(false);
-        sheet_entry.set_buffer(&sheet_layout);
-
+        // binding 0 uniform · 1 tile sheet — vs reads both to place
+        // the ring quads, fs reads them for the SDF (gpu-mini's
+        // entries are VERTEX+FRAGMENT).
         let layout = gpu_mini::new_layout(
             &surface.device,
-            &[gpu_mini::uniform_entry(0), sheet_entry],
-        );
+            &[gpu_mini::uniform_entry(0), gpu_mini::storage_entry(1)],
+        )?;
 
         let pipeline = gpu_mini::fullscreen_pipeline(
             &surface.device,
             surface.format,
             WGSL,
             &[layout.clone()],
-        );
+        )?;
 
         let ubuf = gpu_mini::new_buffer(
             &surface.device,
             (UNIFORM_F32S * 4) as u32,
             gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST,
-        );
+        )?;
 
         let sheet = gpu_mini::new_buffer(
             &surface.device,
             (TILE_F32S * 4) as u32,
             gpu_buffer_usage::STORAGE | gpu_buffer_usage::COPY_DST,
-        );
+        )?;
 
         let bind = gpu_mini::new_bind_group(
             &surface.device,
@@ -179,7 +172,10 @@ impl RingSheen {
             ],
         );
 
-        *self.gpu.borrow_mut() = Some(Gpu {
+        let Ok(mut slot) = self.gpu.try_borrow_mut() else {
+            return Err(JsValue::from_str("init: gpu slot poisoned"));
+        };
+        *slot = Some(Gpu {
             surface,
             pipeline,
             ubuf,
@@ -198,7 +194,14 @@ impl RingSheen {
     /// @param values The flat f32 sheet (len = tiles·8).
     /// @returns The tile count adopted (0 on malformed input).
     pub fn set_tiles(&self, values: &[f32]) -> u32 {
-        let gpu = self.gpu.borrow();
+        // try_borrow everywhere below: a JS exception that crossed a
+        // wasm call frame mid-method leaks the RefCell guard (wasm has
+        // no unwinding) — plain borrow() would then panic
+        // `unreachable` on every later call. try_borrow turns that
+        // poisoned-widget state into a graceful no-op.
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return 0;
+        };
 
         let Some(g) = gpu.as_ref() else {
             return 0;
@@ -206,35 +209,62 @@ impl RingSheen {
 
         let count = (values.len() / TILE_F32S) as u32;
 
-        self.state.borrow_mut().count = count;
+        let Ok(mut s) = self.state.try_borrow_mut() else {
+            return 0;
+        };
+
+        s.count = count;
+        drop(s);
 
         if count == 0 {
             return 0;
         }
 
         if count > g.sheet_cap.get() {
-            *g.sheet.borrow_mut() = gpu_mini::new_buffer(
+            // A device fault mid-regrow keeps the old sheet — the
+            // upload below clips to the old capacity instead of a
+            // wasm panic inside the tile callback.
+            let Ok(sheet) = gpu_mini::new_buffer(
                 &g.surface.device,
                 (values.len() * 4) as u32,
                 gpu_buffer_usage::STORAGE | gpu_buffer_usage::COPY_DST,
-            );
+            ) else {
+                return 0;
+            };
 
+            let Ok(mut sh) = g.sheet.try_borrow_mut() else {
+                return 0;
+            };
+            *sh = sheet;
+            drop(sh);
             g.sheet_cap.set(count);
 
             // Bind groups are immutable — the new buffer needs a new
             // group (cold path: only on growth, once per trigger).
-            *g.bind.borrow_mut() = gpu_mini::new_bind_group(
+            let Ok(sheet_ref) = g.sheet.try_borrow() else {
+                return 0;
+            };
+            let bind = gpu_mini::new_bind_group(
                 &g.surface.device,
                 &g.layout,
                 &[
                     gpu_mini::bind_buffer_entry(0, &g.ubuf),
-                    gpu_mini::bind_buffer_entry(1, &g.sheet.borrow()),
+                    gpu_mini::bind_buffer_entry(1, &sheet_ref),
                 ],
             );
+            drop(sheet_ref);
+
+            let Ok(mut b) = g.bind.try_borrow_mut() else {
+                return 0;
+            };
+            *b = bind;
         }
 
+        let Ok(sheet_ref) = g.sheet.try_borrow() else {
+            return 0;
+        };
         let _ = g.surface.queue.write_buffer_with_u32_and_u8_slice(
-            &g.sheet.borrow(),
+            &sheet_ref,
             0,
             gpu_mini::f32_bytes(values),
         );
@@ -260,7 +290,9 @@ impl RingSheen {
         aa: f32,
         hair: f32,
     ) {
-        let mut s = self.state.borrow_mut();
+        let Ok(mut s) = self.state.try_borrow_mut() else {
+            return;
+        };
 
         s.edge = [er, eg, eb, ea];
         s.accent = [ar, ag, ab, aa];
@@ -276,7 +308,11 @@ impl RingSheen {
     ///
     /// @param w @param h Backing size in device pixels.
     pub fn resize(&self, w: f32, h: f32) {
-        self.state.borrow_mut().dev = [w, h];
+        let Ok(mut s) = self.state.try_borrow_mut() else {
+            return;
+        };
+
+        s.dev = [w, h];
     }
 
     /// `frame` — advance the sweep clock, repack, draw all tiles.
@@ -284,7 +320,9 @@ impl RingSheen {
     /// @param dt Frame delta in seconds.
     /// @returns false once the surface is stale/lost.
     pub fn frame(&self, dt: f32) -> bool {
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return false;
+        };
 
         let Some(g) = gpu.as_ref() else {
             return false;
@@ -294,7 +332,9 @@ impl RingSheen {
 
         self.clock.set(t);
 
-        let s = self.state.borrow();
+        let Ok(s) = self.state.try_borrow() else {
+            return false;
+        };
         let mut u = [0.0f32; UNIFORM_F32S];
 
         u[0] = s.dev[0];
@@ -310,14 +350,26 @@ impl RingSheen {
             return true;
         }
 
-        let bind = g.bind.borrow();
+        let Ok(bind) = g.bind.try_borrow() else {
+            return false;
+        };
         let ok = gpu_mini::draw_n(&g.surface, &g.pipeline, &bind, None, 6, s.count);
 
         ok
     }
 }
 
-/// `destroy` parity — the struct drop releases the device refs.
+/// `destroy` parity — the struct drop releases the device refs via
+/// forget, not destruction: when the JS FinalizationRegistry runs
+/// `__wbg_ringsheen_free` the stored JsValues would each dealloc an
+/// externref slab slot — a table already torn down (device lost,
+/// module unloading) turns that walk into `memory access out of
+/// bounds`. GPU objects die with the shared device anyway, so leaking
+/// the handles is both safe and un-panickable.
 impl Drop for RingSheen {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        if let Some(g) = self.gpu.get_mut().take() {
+            std::mem::forget(g);
+        }
+    }
 }

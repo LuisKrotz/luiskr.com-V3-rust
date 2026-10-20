@@ -101,13 +101,15 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         }
 
         let r = sheet.data[i * 4u];
-        let meta = sheet.data[i * 4u + 1u];
+        // `meta` is a WGSL reserved keyword — the row's second vec4
+        // carries (corner_radius, cell_size, row_size, unused).
+        let row_meta = sheet.data[i * 4u + 1u];
         let sbase = sheet.data[i * 4u + 2u];
         let sink = sheet.data[i * 4u + 3u];
 
         let hs = r.zw * 0.5;
         let c = r.xy + hs;
-        let d = sdRoundBox(p - c, hs, min(meta.x, min(hs.x, hs.y)));
+        let d = sdRoundBox(p - c, hs, min(row_meta.x, min(hs.x, hs.y)));
 
         if (d > 1.0) {
             continue;
@@ -115,8 +117,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
         let edge = 1.0 - smoothstep(-1.0, 1.0, d);
 
-        let cell = meta.y;
-        let row = meta.z;
+        let cell = row_meta.y;
+        let row = row_meta.z;
         let local = p - r.xy;
 
         // Cell addressing: `local` is rect-local px; `cell` is cell size

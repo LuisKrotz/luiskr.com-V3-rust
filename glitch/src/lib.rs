@@ -51,7 +51,7 @@
 
 use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
-use web_sys::{gpu_buffer_usage, HtmlCanvasElement};
+use web_sys::{gpu_buffer_usage, GpuDevice, HtmlCanvasElement};
 
 /// WGSL — the corruption shader (all passes documented inline).
 const WGSL: &str = include_str!("glitch.wgsl");
@@ -130,9 +130,10 @@ impl Glitch {
     /// once the portrait lands (`upload` → `rebind`).
     ///
     /// @param canvas The overlay canvas (positioned over the <img>).
+    /// @param device The shared GPUDevice (one per page, from the JS bridge).
     /// @returns Ok on a live surface, Err(JsValue) on failure.
-    pub async fn init(&self, canvas: HtmlCanvasElement) -> Result<(), JsValue> {
-        let surface = gpu_mini::init_surface(&canvas).await?;
+    pub fn init(&self, canvas: HtmlCanvasElement, device: GpuDevice) -> Result<(), JsValue> {
+        let surface = gpu_mini::init_surface(&canvas, &device)?;
 
         // binding 0 uniform · 1 texture · 2 sampler — the WGSL's
         // declared contract; indices must not drift.
@@ -143,24 +144,30 @@ impl Glitch {
                 gpu_mini::texture_entry(1),
                 gpu_mini::sampler_entry(2),
             ],
-        );
+        )?;
 
         let pipeline = gpu_mini::fullscreen_pipeline(
             &surface.device,
             surface.format,
             WGSL,
             &[layout.clone()],
-        );
+        )?;
 
         let ubuf = gpu_mini::new_buffer(
             &surface.device,
             (UNIFORM_F32S * 4) as u32,
             gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST,
-        );
+        )?;
 
         let sampler = gpu_mini::linear_sampler(&surface.device);
 
-        *self.gpu.borrow_mut() = Some(Gpu {
+        // try_borrow everywhere: a JS exception crossing a wasm frame
+        // mid-call leaks the RefCell guard — a later borrow() panics
+        // `unreachable` (the observed widget-crash cascade).
+        let Ok(mut slot) = self.gpu.try_borrow_mut() else {
+            return Err(JsValue::from_str("init: gpu slot poisoned"));
+        };
+        *slot = Some(Gpu {
             surface,
             pipeline,
             ubuf,
@@ -186,37 +193,53 @@ impl Glitch {
     /// @param bitmap The decoded portrait (`createImageBitmap(img)`).
     /// @returns true when the texture landed, false before init.
     pub fn upload(&self, bitmap: &web_sys::ImageBitmap) -> bool {
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return false;
+        };
 
         let Some(g) = gpu.as_ref() else {
             return false;
         };
 
-        let tex = gpu_mini::bitmap_texture(
+        // A device fault mid-upload reports false — the JS arm keeps
+        // the 2D fallback alive rather than a wasm panic poisoning
+        // the mount closures.
+        let Ok(tex) = gpu_mini::bitmap_texture(
             &g.surface.device,
             &g.surface.queue,
             bitmap,
             bitmap.width(),
             bitmap.height(),
-        );
+        ) else {
+            return false;
+        };
 
-        *g.tex.borrow_mut() = Some(tex);
+        let Ok(v) = gpu_mini::view(&tex) else {
+            return false;
+        };
+
+        let Ok(mut t) = g.tex.try_borrow_mut() else {
+            return false;
+        };
+        *t = Some(tex);
+        drop(t);
 
         // Rebuild the bind group with the fresh view — bind groups are
         // immutable by spec, so a texture swap means a new group.
-        let t = g.tex.borrow();
-        let t = t.as_ref().unwrap();
         let bind = gpu_mini::new_bind_group(
             &g.surface.device,
             &g.layout,
             &[
                 gpu_mini::bind_buffer_entry(0, &g.ubuf),
-                gpu_mini::bind_view_entry(1, &gpu_mini::view(t)),
+                gpu_mini::bind_view_entry(1, &v),
                 gpu_mini::bind_sampler_entry(2, &g.sampler),
             ],
         );
 
-        *g.bind.borrow_mut() = Some(bind);
+        let Ok(mut b) = g.bind.try_borrow_mut() else {
+            return false;
+        };
+        *b = Some(bind);
 
         true
     }
@@ -228,7 +251,9 @@ impl Glitch {
     /// @param dx @param dy Dest rect origin (device px).
     /// @param dw @param dh Dest rect size (device px).
     pub fn set_cover(&self, dx: f32, dy: f32, dw: f32, dh: f32) {
-        self.state.borrow_mut().cover = [dx, dy, dw, dh];
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.cover = [dx, dy, dw, dh];
+        }
     }
 
     /// `set_hover` — the intensity latch: 0 = idle ambient, 1 = full
@@ -236,7 +261,9 @@ impl Glitch {
     ///
     /// @param hover 0 or 1.
     pub fn set_hover(&self, hover: f32) {
-        self.state.borrow_mut().hover = if hover > 0.5 { 1.0 } else { 0.0 };
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.hover = if hover > 0.5 { 1.0 } else { 0.0 };
+        }
     }
 
     /// `set_size` — CSS px (kept for bridge contract parity; the
@@ -250,7 +277,9 @@ impl Glitch {
     ///
     /// @param w @param h Backing size in device pixels.
     pub fn resize(&self, w: f32, h: f32) {
-        self.state.borrow_mut().dev = [w, h];
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.dev = [w, h];
+        }
     }
 
     /// `frame` — advance the clock + RNG, repack the uniform, draw.
@@ -265,13 +294,17 @@ impl Glitch {
     /// @param dt Frame delta in seconds (roll-bar clock).
     /// @returns false once the surface is stale/lost.
     pub fn frame(&self, dt: f32) -> bool {
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return false;
+        };
 
         let Some(g) = gpu.as_ref() else {
             return false;
         };
 
-        let bind = g.bind.borrow();
+        let Ok(bind) = g.bind.try_borrow() else {
+            return false;
+        };
 
         let Some(b) = bind.as_ref() else {
             return false;
@@ -290,7 +323,9 @@ impl Glitch {
 
         self.clock.set(t);
 
-        let s = self.state.borrow();
+        let Ok(s) = self.state.try_borrow() else {
+            return false;
+        };
         let mut u = [0.0f32; UNIFORM_F32S];
 
         u[0] = s.dev[0];
@@ -306,7 +341,15 @@ impl Glitch {
     }
 }
 
-/// `destroy` parity — the struct drop releases the device refs.
+/// `destroy` parity — forget the GPU state instead of destructing
+/// it: the FinalizationRegistry's `__wbg_*_free` walks every stored
+/// JsValue's externref dealloc — on a torn-down table that traps
+/// `memory access out of bounds` during GC. GPU objects die with the
+/// shared device; leaking the handles is safe and un-panickable.
 impl Drop for Glitch {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        if let Some(g) = self.gpu.get_mut().take() {
+            std::mem::forget(g);
+        }
+    }
 }

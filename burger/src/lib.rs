@@ -19,7 +19,7 @@
 
 use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
-use web_sys::HtmlCanvasElement;
+use web_sys::{GpuDevice, HtmlCanvasElement};
 
 /// WGSL — the hairline-bars shader (fluid wave + breathing pulse).
 const WGSL: &str = include_str!("burger.wgsl");
@@ -63,9 +63,21 @@ impl Burger {
     /// keeps the DOM/CSS burger; mounting can never regress the page.
     ///
     /// @param canvas The widget's dedicated canvas.
+    /// @param device The shared GPUDevice (one per page, from the JS bridge).
     /// @returns Ok on a live surface, Err(JsValue) on failure.
-    pub async fn init(&self, canvas: HtmlCanvasElement) -> Result<(), JsValue> {
-        *self.gpu.borrow_mut() = Some(gpu_mini::init_widget(&canvas, WGSL).await?);
+    pub fn init(&self, canvas: HtmlCanvasElement, device: GpuDevice) -> Result<(), JsValue> {
+        // try_borrow everywhere: a JS exception crossing a wasm frame
+        // mid-call leaks the RefCell guard — a later borrow() panics
+        // `unreachable` (the observed widget-crash cascade). Build the
+        // GPU state BEFORE taking the guard so the fallible JS-boundary
+        // calls can never run while the borrow is held.
+        let built = gpu_mini::init_widget(&canvas, &device, WGSL)?;
+
+        let Ok(mut slot) = self.gpu.try_borrow_mut() else {
+            return Err(JsValue::from_str("init: gpu slot poisoned"));
+        };
+
+        *slot = Some(built);
         Ok(())
     }
 
@@ -79,7 +91,9 @@ impl Burger {
     pub fn resize(&self, w: u32, h: u32) {
         self.dev.set([(w.max(1)) as f32, (h.max(1)) as f32]);
 
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return;
+        };
 
         if let Some(w) = gpu.as_ref() {
             gpu_mini::resize(&w.surface);
@@ -92,7 +106,9 @@ impl Burger {
     /// @param w Canvas width in CSS pixels.
     /// @param h Canvas height in CSS pixels.
     pub fn set_size(&self, w: f32, h: f32) {
-        *self.css.borrow_mut() = [w.max(1.0), h.max(1.0)];
+        if let Ok(mut c) = self.css.try_borrow_mut() {
+            *c = [w.max(1.0), h.max(1.0)];
+        }
     }
 
     /// `set_dark` — the theme lerp: 0 = light, 1 = dark. Clamped —
@@ -107,7 +123,9 @@ impl Burger {
     ///
     /// @param dt Seconds since the previous call.
     pub fn frame(&self, dt: f32) {
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return;
+        };
 
         let Some(w) = gpu.as_ref() else {
             return;
@@ -115,7 +133,11 @@ impl Burger {
 
         self.clock.set(self.clock.get() + dt);
 
-        let css = *self.css.borrow();
+        let Ok(css_ref) = self.css.try_borrow() else {
+            return;
+        };
+        let css = *css_ref;
+        drop(css_ref);
         let dev = self.dev.get();
 
         // [0] time  [1,2] res (CSS px)  [3] dark
@@ -133,6 +155,19 @@ impl Burger {
 
         if !gpu_mini::widget_frame(w, &uniforms) {
             gpu_mini::resize(&w.surface);
+        }
+    }
+}
+
+/// `destroy` parity — forget the GPU state instead of destructing
+/// it: the FinalizationRegistry's `__wbg_*_free` walks every stored
+/// JsValue's externref dealloc — on a torn-down table that traps
+/// `memory access out of bounds` during GC. GPU objects die with the
+/// shared device; leaking the handles is safe and un-panickable.
+impl Drop for Burger {
+    fn drop(&mut self) {
+        if let Some(g) = self.gpu.get_mut().take() {
+            std::mem::forget(g);
         }
     }
 }

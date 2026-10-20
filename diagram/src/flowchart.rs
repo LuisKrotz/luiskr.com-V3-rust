@@ -35,11 +35,11 @@ use std::collections::HashMap;
 
 /// Gap between rank columns (LR) / rows (TD), px. Raising it spreads
 /// the diagram along the flow axis; too low and edge labels collide.
-const RANK_GAP: f32 = 60.0;
+const RANK_GAP: f32 = 72.0;
 
 /// Gap between siblings inside a rank, px. Vertical breathing room in
 /// LR mode; raising it makes fan-outs taller, not wider.
-const SIB_GAP: f32 = 34.0;
+const SIB_GAP: f32 = 48.0;
 
 /// Padding inside a subgraph cluster box around its children, px.
 const GROUP_PAD: f32 = 22.0;
@@ -124,9 +124,18 @@ fn parse_node(spec: &str) -> Option<(String, Vec<String>, Shape, usize)> {
         }
         let label = label.strip_suffix('"').unwrap_or(label);
         let lines = label_lines(label);
-        let lines = if lines.is_empty() { vec![id.clone()] } else { lines };
+        let lines = if lines.is_empty() {
+            vec![id.clone()]
+        } else {
+            lines
+        };
 
-        Some((id, lines, shape, lead + id_len + open_len + end + close.len()))
+        Some((
+            id,
+            lines,
+            shape,
+            lead + id_len + open_len + end + close.len(),
+        ))
     } else {
         Some((id.clone(), vec![id], Shape::Rect, lead + id_len))
     }
@@ -152,11 +161,7 @@ fn edge_op(s: &str) -> Option<(EdgeKind, usize)> {
 /// Parses an edge statement line into (edge, chain). Returns the list
 /// of (from_id, to_id, label, kind) pairs — chains emit consecutive
 /// pairs sharing the middle node.
-fn parse_edges(
-    g: &mut Graph,
-    line: &str,
-    group: &str,
-) {
+fn parse_edges(g: &mut Graph, line: &str, group: &str) {
     let mut rest = line;
     let mut prev_id: Option<String> = None;
     let mut pending: Option<(String, Vec<String>, EdgeKind)> = None;
@@ -224,9 +229,8 @@ fn parse_edges(
         // A shaped declaration refines a bare auto-created node
         // (`A --> B` then `B["real label"]` — keep the real shape).
         // "Bare" = Rect + the label is literally the id string.
-        let bare = entry.shape == Shape::Rect
-            && entry.lines.len() == 1
-            && entry.lines[0] == entry.id;
+        let bare =
+            entry.shape == Shape::Rect && entry.lines.len() == 1 && entry.lines[0] == entry.id;
 
         if shape != Shape::Rect || bare {
             entry.lines = lines;
@@ -305,12 +309,19 @@ fn parse(source: &str) -> Graph {
             let (id, label) = if let Some((id, lines, _s, _u)) = parse_node(spec) {
                 (id, lines)
             } else {
-                (spec.trim_matches('"').to_string(), label_lines(spec.trim_matches('"')))
+                (
+                    spec.trim_matches('"').to_string(),
+                    label_lines(spec.trim_matches('"')),
+                )
             };
 
             g.groups.push(Group {
                 id: id.clone(),
-                lines: if label.is_empty() { vec![id.clone()] } else { label },
+                lines: if label.is_empty() {
+                    vec![id.clone()]
+                } else {
+                    label
+                },
                 x: 0.0,
                 y: 0.0,
                 w: 0.0,
@@ -322,7 +333,12 @@ fn parse(source: &str) -> Graph {
 
         // `direction XX` inside a subgraph — legal mermaid; the corpus
         // doesn't nest directions so we accept-and-ignore it.
-        if line.starts_with("direction") || line.starts_with("classDef") || line.starts_with("class ") || line.starts_with("style ") || line.starts_with("linkStyle") {
+        if line.starts_with("direction")
+            || line.starts_with("classDef")
+            || line.starts_with("class ")
+            || line.starts_with("style ")
+            || line.starts_with("linkStyle")
+        {
             continue;
         }
 
@@ -447,7 +463,11 @@ fn layout(g: &mut Graph, theme: &Theme) {
             .map(|&i| {
                 let n = &g.nodes[&g.ids[i]];
 
-                if g.horizontal { n.w } else { n.h }
+                if g.horizontal {
+                    n.w
+                } else {
+                    n.h
+                }
             })
             .fold(0.0, f32::max);
 
@@ -461,13 +481,19 @@ fn layout(g: &mut Graph, theme: &Theme) {
                     .map(|&p| {
                         let n = &g.nodes[&g.ids[p]];
 
-                        if g.horizontal { n.y } else { n.x }
+                        if g.horizontal {
+                            n.y
+                        } else {
+                            n.x
+                        }
                     })
                     .sum::<f32>()
                     / pred[i].len() as f32
             };
 
-            bc(a).partial_cmp(&bc(b)).unwrap_or(std::cmp::Ordering::Equal)
+            bc(a)
+                .partial_cmp(&bc(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         // Stack the rank on the cross axis, centered at 0 for now —
@@ -477,7 +503,11 @@ fn layout(g: &mut Graph, theme: &Theme) {
             .map(|&i| {
                 let n = &g.nodes[&g.ids[i]];
 
-                if g.horizontal { n.h } else { n.w }
+                if g.horizontal {
+                    n.h
+                } else {
+                    n.w
+                }
             })
             .sum::<f32>()
             + SIB_GAP * buckets[r].len().saturating_sub(1) as f32;
@@ -489,7 +519,10 @@ fn layout(g: &mut Graph, theme: &Theme) {
             // Along-axis center = margin + this rank's start offset +
             // half the node's own extent (nodes are center-anchored).
             // Cross-axis center = running cursor + half the extent.
-            let cross_c = cross + if g.horizontal { n.h } else { n.w } / 2.0;
+            // `if … else …` is an expression — without parens `/2.0` would
+            // bind to the else arm only (horizontal then doubled the
+            // offset). Same for `+ SIB_GAP` below.
+            let cross_c = cross + (if g.horizontal { n.h } else { n.w }) / 2.0;
 
             if g.horizontal {
                 n.x = MARGIN + rank_offset + n.w / 2.0;
@@ -499,7 +532,7 @@ fn layout(g: &mut Graph, theme: &Theme) {
                 n.y = MARGIN + rank_offset + n.h / 2.0;
             }
 
-            cross += if g.horizontal { n.h } else { n.w } + SIB_GAP;
+            cross += (if g.horizontal { n.h } else { n.w }) + SIB_GAP;
         }
 
         rank_offset += major_w + RANK_GAP;
@@ -512,8 +545,16 @@ fn layout(g: &mut Graph, theme: &Theme) {
         let mut ma = 0.0f32;
 
         for n in g.nodes.values() {
-            let c = if g.horizontal { n.y - n.h / 2.0 } else { n.x - n.w / 2.0 };
-            let a = if g.horizontal { n.x + n.w / 2.0 } else { n.y + n.h / 2.0 };
+            let c = if g.horizontal {
+                n.y - n.h / 2.0
+            } else {
+                n.x - n.w / 2.0
+            };
+            let a = if g.horizontal {
+                n.x + n.w / 2.0
+            } else {
+                n.y + n.h / 2.0
+            };
 
             mc = mc.min(c);
             ma = ma.max(a);
@@ -611,8 +652,16 @@ fn border(n: &Node, tx: f32, ty: f32) -> (f32, f32) {
         return (n.x, n.y);
     }
 
-    let sx = if dx != 0.0 { (n.w / 2.0) / dx.abs() } else { f32::MAX };
-    let sy = if dy != 0.0 { (n.h / 2.0) / dy.abs() } else { f32::MAX };
+    let sx = if dx != 0.0 {
+        (n.w / 2.0) / dx.abs()
+    } else {
+        f32::MAX
+    };
+    let sy = if dy != 0.0 {
+        (n.h / 2.0) / dy.abs()
+    } else {
+        f32::MAX
+    };
     let s = sx.min(sy);
 
     (n.x + dx * s, n.y + dy * s)
@@ -698,22 +747,66 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
     rank(&mut g);
     layout(&mut g, theme);
 
-    // Canvas extents — groups may exceed node bounds on the label side.
-    let mut w = 0.0f32;
-    let mut h = 0.0f32;
+    // Painted bounds — groups may exceed node bounds on the label side;
+    // edge-label chips and self-edge loops can overshoot every side, so
+    // the extents fold them in too. A negative min corner becomes the
+    // viewBox origin instead of clipping those elements.
+    let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
+    let (mut max_x, mut max_y) = (0.0f32, 0.0f32);
+
+    let mut grow = |x0: f32, y0: f32, x1: f32, y1: f32| {
+        min_x = min_x.min(x0);
+        min_y = min_y.min(y0);
+        max_x = max_x.max(x1);
+        max_y = max_y.max(y1);
+    };
 
     for n in g.nodes.values() {
-        w = w.max(n.x + n.w / 2.0 + MARGIN);
-        h = h.max(n.y + n.h / 2.0 + MARGIN);
+        grow(
+            n.x - n.w / 2.0,
+            n.y - n.h / 2.0,
+            n.x + n.w / 2.0,
+            n.y + n.h / 2.0,
+        );
     }
     for grp in &g.groups {
-        w = w.max(grp.x + grp.w + MARGIN);
-        h = h.max(grp.y + grp.h + MARGIN);
+        grow(grp.x, grp.y, grp.x + grp.w, grp.y + grp.h);
     }
+    for e in &g.edges {
+        let (Some(a), Some(b)) = (g.nodes.get(&e.from), g.nodes.get(&e.to)) else {
+            continue;
+        };
+
+        if e.from == e.to {
+            // Self-loop extends `a.w/2 + 18` px past the node's right
+            // edge plus the arrowhead's reach below the loop.
+            let reach = a.x + a.w / 2.0 + a.w / 2.0 + 18.0 + svg::ARROW;
+
+            grow(a.x, a.y - 6.0 - svg::ARROW, reach, a.y + 6.0 + svg::ARROW);
+
+            continue;
+        }
+
+        if e.label.is_empty() {
+            continue;
+        }
+
+        let (x1, y1) = border(a, b.x, b.y);
+        let (x2, y2) = border(b, a.x, a.y);
+        let (lw, lh) = svg::label_size(&e.label, theme);
+        let (mx, my) = ((x1 + x2) / 2.0, (y1 + y2) / 2.0);
+
+        grow(mx - lw / 2.0, my - lh / 2.0, mx + lw / 2.0, my + lh / 2.0);
+    }
+
+    let w = max_x - min_x + MARGIN * 2.0;
+    let h = max_y - min_y + MARGIN * 2.0;
+    let origin_x = min_x - MARGIN;
+    let origin_y = min_y - MARGIN;
 
     let mut out = String::with_capacity(4096 + g.edges.len() * 200);
 
-    svg::open(&mut out, w, h);
+    svg::open(&mut out, origin_x, origin_y, w, h);
 
     // Paint order: cluster boxes UNDER edges UNDER nodes — the lines
     // must not cover node fills, clusters must sit behind everything.
@@ -761,7 +854,16 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
         let (x1, y1) = border(a, b.x, b.y);
         let (x2, y2) = border(b, a.x, a.y);
 
-        svg::edge_line(&mut out, x1, y1, x2, y2, e.kind == EdgeKind::Dashed, e.kind == EdgeKind::Thick, theme);
+        svg::edge_line(
+            &mut out,
+            x1,
+            y1,
+            x2,
+            y2,
+            e.kind == EdgeKind::Dashed,
+            e.kind == EdgeKind::Thick,
+            theme,
+        );
 
         if e.kind != EdgeKind::Open {
             svg::arrow_head(&mut out, x2, y2, x2 - x1, y2 - y1, theme);

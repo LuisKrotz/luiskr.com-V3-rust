@@ -30,7 +30,7 @@
 
 use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
-use web_sys::{gpu_buffer_usage, HtmlCanvasElement};
+use web_sys::{gpu_buffer_usage, GpuDevice, HtmlCanvasElement};
 
 /// WGSL — wind-warp + specular flag shader.
 const WGSL: &str = include_str!("flag.wgsl");
@@ -110,9 +110,10 @@ impl Flag {
     /// once textures land (`upload_textures` → `rebind`).
     ///
     /// @param canvas The widget's dedicated canvas.
+    /// @param device The shared GPUDevice (one per page, from the JS bridge).
     /// @returns Ok on a live surface, Err(JsValue) on failure.
-    pub async fn init(&self, canvas: HtmlCanvasElement) -> Result<(), JsValue> {
-        let surface = gpu_mini::init_surface(&canvas).await?;
+    pub fn init(&self, canvas: HtmlCanvasElement, device: GpuDevice) -> Result<(), JsValue> {
+        let surface = gpu_mini::init_surface(&canvas, &device)?;
 
         // binding 0 uniform · 1 tex1 · 2 tex2 · 3 sampler — the WGSL's
         // declared contract; indices must not drift.
@@ -124,24 +125,30 @@ impl Flag {
                 gpu_mini::texture_entry(2),
                 gpu_mini::sampler_entry(3),
             ],
-        );
+        )?;
 
         let pipeline = gpu_mini::fullscreen_pipeline(
             &surface.device,
             surface.format,
             WGSL,
             &[layout.clone()],
-        );
+        )?;
 
         let ubuf = gpu_mini::new_buffer(
             &surface.device,
             256,
             gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST,
-        );
+        )?;
 
         let sampler = gpu_mini::linear_sampler(&surface.device);
 
-        *self.gpu.borrow_mut() = Some(Gpu {
+        // try_borrow everywhere: a JS exception crossing a wasm frame
+        // mid-call leaks the RefCell guard — a later borrow() panics
+        // `unreachable` (the observed widget-crash cascade).
+        let Ok(mut slot) = self.gpu.try_borrow_mut() else {
+            return Err(JsValue::from_str("init: gpu slot poisoned"));
+        };
+        *slot = Some(Gpu {
             surface,
             pipeline,
             ubuf,
@@ -170,30 +177,50 @@ impl Flag {
     ///          unsplit locales — a duplicate binding is the cheapest
     ///          no-op).
     pub fn upload_textures(&self, a: web_sys::ImageBitmap, b: web_sys::ImageBitmap) {
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return;
+        };
 
         let Some(g) = gpu.as_ref() else {
             return;
         };
 
-        let t1 = gpu_mini::bitmap_texture(
-            &g.surface.device,
-            &g.surface.queue,
-            &a,
-            a.width(),
-            a.height(),
-        );
+        // A device fault mid-upload keeps the previous textures/bind —
+        // the flag keeps waving with stale pixels rather than
+        // panicking inside the upload callback.
+        let (Ok(t1), Ok(t2)) = (
+            gpu_mini::bitmap_texture(
+                &g.surface.device,
+                &g.surface.queue,
+                &a,
+                a.width(),
+                a.height(),
+            ),
+            gpu_mini::bitmap_texture(
+                &g.surface.device,
+                &g.surface.queue,
+                &b,
+                b.width(),
+                b.height(),
+            ),
+        ) else {
+            return;
+        };
 
-        let t2 = gpu_mini::bitmap_texture(
-            &g.surface.device,
-            &g.surface.queue,
-            &b,
-            b.width(),
-            b.height(),
-        );
+        let (Ok(v1), Ok(v2)) = (gpu_mini::view(&t1), gpu_mini::view(&t2)) else {
+            return;
+        };
 
-        *g.tex1.borrow_mut() = Some(t1);
-        *g.tex2.borrow_mut() = Some(t2);
+        let Ok(mut t1_slot) = g.tex1.try_borrow_mut() else {
+            return;
+        };
+        *t1_slot = Some(t1);
+        drop(t1_slot);
+        let Ok(mut t2_slot) = g.tex2.try_borrow_mut() else {
+            return;
+        };
+        *t2_slot = Some(t2);
+        drop(t2_slot);
 
         // Rebuild the bind group with the fresh views — bind groups are
         // immutable by spec, so a texture swap means a new group.
@@ -202,19 +229,16 @@ impl Flag {
             &g.layout,
             &[
                 gpu_mini::bind_buffer_entry(0, &g.ubuf),
-                gpu_mini::bind_view_entry(
-                    1,
-                    &gpu_mini::view(g.tex1.borrow().as_ref().unwrap()),
-                ),
-                gpu_mini::bind_view_entry(
-                    2,
-                    &gpu_mini::view(g.tex2.borrow().as_ref().unwrap()),
-                ),
+                gpu_mini::bind_view_entry(1, &v1),
+                gpu_mini::bind_view_entry(2, &v2),
                 gpu_mini::bind_sampler_entry(3, &g.sampler),
             ],
         );
 
-        *g.bind.borrow_mut() = Some(bind);
+        let Ok(mut b) = g.bind.try_borrow_mut() else {
+            return;
+        };
+        *b = Some(bind);
     }
 
     /// `resize` — canvas-bitmap change → surface re-configure.
@@ -222,9 +246,13 @@ impl Flag {
     /// @param _w Device-pixel width (element-side).
     /// @param _h Device-pixel height.
     pub fn resize(&self, w: u32, h: u32) {
-        self.state.borrow_mut().dev = [(w.max(1)) as f32, (h.max(1)) as f32];
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.dev = [(w.max(1)) as f32, (h.max(1)) as f32];
+        }
 
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return;
+        };
 
         if let Some(g) = gpu.as_ref() {
             gpu_mini::resize(&g.surface);
@@ -236,7 +264,9 @@ impl Flag {
     /// @param w Canvas width in CSS pixels.
     /// @param h Canvas height in CSS pixels.
     pub fn set_size(&self, w: f32, h: f32) {
-        self.state.borrow_mut().css = [w.max(1.0), h.max(1.0)];
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.css = [w.max(1.0), h.max(1.0)];
+        }
     }
 
     /// `set_state` — bundled scalar update: hover amount, the locale
@@ -247,7 +277,9 @@ impl Flag {
     /// @param is_split 0 single / 1 split flag.
     /// @param split_x Seam position 0..1.
     pub fn set_state(&self, hover: f32, anim: f32, is_split: f32, split_x: f32) {
-        let mut s = self.state.borrow_mut();
+        let Ok(mut s) = self.state.try_borrow_mut() else {
+            return;
+        };
 
         s.hover = hover.clamp(0.0, 1.0);
         s.anim = anim;
@@ -261,13 +293,17 @@ impl Flag {
     ///
     /// @param dt Seconds since the previous call.
     pub fn frame(&self, dt: f32) {
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return;
+        };
 
         let Some(g) = gpu.as_ref() else {
             return;
         };
 
-        let bind = g.bind.borrow();
+        let Ok(bind) = g.bind.try_borrow() else {
+            return;
+        };
 
         let Some(bind) = bind.as_ref() else {
             return;
@@ -275,7 +311,9 @@ impl Flag {
 
         self.clock.set(self.clock.get() + dt);
 
-        let s = self.state.borrow();
+        let Ok(s) = self.state.try_borrow() else {
+            return;
+        };
 
         // [0,1] res [2] time [3] hover [4] anim [5] is_split
         // [6] split_x [7] pad [8..11] rect = (0,0,w,h)
@@ -300,6 +338,19 @@ impl Flag {
 
         if !gpu_mini::draw(&g.surface, &g.pipeline, bind, None) {
             gpu_mini::resize(&g.surface);
+        }
+    }
+}
+
+/// `destroy` parity — forget the GPU state instead of destructing
+/// it: the FinalizationRegistry's `__wbg_*_free` walks every stored
+/// JsValue's externref dealloc — on a torn-down table that traps
+/// `memory access out of bounds` during GC. GPU objects die with the
+/// shared device; leaking the handles is safe and un-panickable.
+impl Drop for Flag {
+    fn drop(&mut self) {
+        if let Some(g) = self.gpu.get_mut().take() {
+            std::mem::forget(g);
         }
     }
 }

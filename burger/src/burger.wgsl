@@ -100,9 +100,12 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // NOTE: rect is DEVICE px (written by `resize`) — same unit as
     // `frag`, so this division is exact at any DPR. `res` stays CSS px
     // for design-unit math (`uv * res` = CSS px positions).
+    // uv.y is flipped: WGSL `frag` is framebuffer-origin (y=0 TOP) but
+    // the ported GLSL measured gl_FragCoord (y=0 BOTTOM) — the bars'
+    // wave phase and asymmetry constants assume bottom-origin.
     let uv = vec2<f32>(
         (frag.x - u.rect.x) / u.rect.z,
-        (frag.y - u.rect.y) / u.rect.w,
+        1.0 - (frag.y - u.rect.y) / u.rect.w,
     );
     let t = u.time;
 

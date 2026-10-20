@@ -151,15 +151,21 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         // push samples outside [0,1], and unclamped wrapping would smear
         // the opposite edge's pixels (repeat addressing is off anyway,
         // but the clamp makes the intent explicit and driver-proof).
-        if (uvWarp.x < u.split_x) {
-            var uv1 = vec2<f32>(uvWarp.x / u.split_x * 0.5, uvWarp.y);
-            uv1 = clamp(uv1, vec2<f32>(0.005), vec2<f32>(0.995));
-            col = textureSample(tex1, samp, uv1);
-        } else {
-            var uv2 = vec2<f32>(0.5 + (uvWarp.x - u.split_x) / (1.0 - u.split_x) * 0.5, uvWarp.y);
-            uv2 = clamp(uv2, vec2<f32>(0.005), vec2<f32>(0.995));
-            col = textureSample(tex2, samp, uv2);
-        }
+        // Both halves sample unconditionally: `uvWarp.x` is fragment-
+        // varying so a textureSample inside `if (uvWarp.x < split_x)`
+        // is non-uniform control flow — illegal for implicit-
+        // derivative sampling (Dawn: "'textureSample' must only be
+        // called from uniform control flow"). Sample both, select.
+        var uv1 = vec2<f32>(uvWarp.x / u.split_x * 0.5, uvWarp.y);
+        uv1 = clamp(uv1, vec2<f32>(0.005), vec2<f32>(0.995));
+
+        var uv2 = vec2<f32>(0.5 + (uvWarp.x - u.split_x) / (1.0 - u.split_x) * 0.5, uvWarp.y);
+        uv2 = clamp(uv2, vec2<f32>(0.005), vec2<f32>(0.995));
+
+        let t1 = textureSample(tex1, samp, uv1);
+        let t2 = textureSample(tex2, samp, uv2);
+
+        col = select(t2, t1, uvWarp.x < u.split_x);
 
         // The seam itself — a 1.5%-wide darkened dividing line so the
         // two flag halves read as stitched cloth, not a hard cut.

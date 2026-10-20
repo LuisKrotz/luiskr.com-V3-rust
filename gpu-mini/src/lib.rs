@@ -34,9 +34,14 @@
 //!       when the current task ends (no explicit present in WebGPU JS).
 //! ```
 
+// web_sys's WebGPU surface (GpuCanvasContext/GpuDevice/…) is
+// wasm32-only; other crates gate their wasm halves and host-test
+// their pure modules, which needs this dependency to be an empty
+// crate off-wasm.
+#![cfg(target_arch = "wasm32")]
+
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::JsFuture;
 use web_sys::*;
 
 /// `Surface` — a live WebGPU canvas: context + device + queue + the
@@ -53,44 +58,70 @@ pub struct Surface {
     pub format: GpuTextureFormat,
 }
 
-/// `init_surface` — the one async step: `navigator.gpu` → adapter →
-/// device → canvas context → configure. Any failure returns Err so
-/// the JS bridge falls back to the WebGL/CSS widget — mounting a
-/// widget crate can never regress the page.
+/// `init_surface` — bind a canvas to the page's SHARED GPUDevice.
+///
+/// The device is acquired once in JS (`getSharedGpuDevice` in
+/// core/utils/gpu/webgpu-widget.ts) and passed to every widget
+/// artifact — WebGPU is built for one device serving many canvases,
+/// and per-widget devices exhausted the driver's device budget on a
+/// widget-heavy page (Windows/D3D12: `create command queue failed
+/// with E_OUTOFMEMORY` after ~100 devices; a failed requestDevice
+/// resolves an undefined handle whose method calls then trap the
+/// wasm module with `unreachable`).
+///
+/// Sync by design: with the device already in hand there is nothing
+/// to await — and a synchronous init can never leave a wasm-bindgen
+/// closure dangling (the async-future trap was the "closure invoked
+/// recursively or after being dropped" cascade).
 ///
 /// @param canvas The dedicated canvas this widget draws into.
+/// @param device The shared GPUDevice acquired by the JS bridge.
 /// @returns A configured `Surface`, or a JsValue error string.
-pub async fn init_surface(canvas: &HtmlCanvasElement) -> Result<Surface, JsValue> {
-    let window = web_sys::window().ok_or("no window")?;
-    let gpu = window.navigator().gpu();
+pub fn init_surface(canvas: &HtmlCanvasElement, device: &GpuDevice) -> Result<Surface, JsValue> {
+    // A failed shared-device request must not reach here, but if it
+    // does, queue()/configure() on an undefined handle throws a JS
+    // TypeError — and JS throws inside wasm bindings abort the module
+    // as `unreachable`. Guard the handle's shape before touching it.
+    let handle: &JsValue = device.as_ref();
+    if handle.is_undefined() || handle.is_null() {
+        return Err(JsValue::from_str("init_surface: no usable GPUDevice"));
+    }
 
-    let adapter = JsFuture::from(gpu.request_adapter())
-        .await
-        .map_err(|e| JsValue::from_str(&format!("adapter: {e:?}")))?
-        .dyn_into::<GpuAdapter>()
-        .map_err(|_| JsValue::from_str("adapter: unavailable"))?;
-
-    let device = JsFuture::from(adapter.request_device())
-        .await
-        .map_err(|e| JsValue::from_str(&format!("device: {e:?}")))?;
     let queue = device.queue();
 
     // `get_context("webgpu")` returns a generic Object; unchecked_into
     // is safe because the browser only returns a GPUCanvasContext for
-    // that context name.
+    // that context name. The canvas param is typed HtmlCanvasElement
+    // but wasm-bindgen externrefs carry ANY JS object — the render
+    // worker passes an OffscreenCanvas here, whose getContext/width/
+    // height surface is identical.
     let context = canvas
         .get_context("webgpu")
         .map_err(|e| JsValue::from_str(&format!("context: {e:?}")))?
         .ok_or("context: webgpu unavailable")?
         .unchecked_into::<GpuCanvasContext>();
 
-    let format = gpu.get_preferred_canvas_format();
+    // `navigator.gpu` can be an undefined JsValue — calling
+    // get_preferred_canvas_format on it throws (→ wasm trap), so fall
+    // back to bgra8unorm: the preferred format on every desktop
+    // browser, and unreachable anyway when a real device was passed.
+    // globalThis — NOT web_sys::window(): dedicated workers have no
+    // window but DO expose navigator.gpu (WorkerNavigator) — this is
+    // what lets every widget init off the main thread.
+    let gpu = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("navigator"))
+        .and_then(|nav| js_sys::Reflect::get(&nav, &JsValue::from_str("gpu")))
+        .unwrap_or(JsValue::UNDEFINED);
+    let format = if gpu.is_undefined() {
+        GpuTextureFormat::Bgra8unorm
+    } else {
+        gpu.unchecked_into::<Gpu>().get_preferred_canvas_format()
+    };
 
-    configure(&context, &device, format);
+    configure(&context, device, format);
 
     Ok(Surface {
         context,
-        device,
+        device: device.clone(),
         queue,
         format,
     })
@@ -108,6 +139,16 @@ pub async fn init_surface(canvas: &HtmlCanvasElement) -> Result<Surface, JsValue
 pub fn configure(context: &GpuCanvasContext, device: &GpuDevice, format: GpuTextureFormat) {
     let desc = GpuCanvasConfiguration::new(device, format);
     desc.set_alpha_mode(GpuCanvasAlphaMode::Premultiplied);
+    // RENDER_ATTACHMENT alone is the default, but some drivers also
+    // validate canvas textures as copy destinations when an external-
+    // image or texture copy lands on them — declaring COPY_DST keeps
+    // the surface usable for every sanctioned op. COPY_SRC lets
+    // toDataURL/readback paths capture the presented frame.
+    desc.set_usage(
+        gpu_texture_usage::RENDER_ATTACHMENT
+            | gpu_texture_usage::COPY_DST
+            | gpu_texture_usage::COPY_SRC,
+    );
     let _ = context.configure(&desc);
 }
 
@@ -128,9 +169,13 @@ pub fn resize(surface: &Surface) {
 /// @param device The factory device.
 /// @param size Byte size.
 /// @param usage GpuBufferUsage bitmask.
-/// @returns The created buffer.
-pub fn new_buffer(device: &GpuDevice, size: u32, usage: u32) -> GpuBuffer {
-    device.create_buffer(&GpuBufferDescriptor::new(size, usage)).expect("create_buffer")
+/// @returns The created buffer, or Err so a device fault inside an
+///   async init surfaces as a JS rejection (the WebGL fallback path)
+///   instead of a wasm panic poisoning the glue closures.
+pub fn new_buffer(device: &GpuDevice, size: u32, usage: u32) -> Result<GpuBuffer, JsValue> {
+    device
+        .create_buffer(&GpuBufferDescriptor::new(size, usage))
+        .map_err(|e| JsValue::from_str(&format!("create_buffer: {e:?}")))
 }
 
 /// `write_f32s` — upload an f32 slice into a buffer. The browser
@@ -151,18 +196,26 @@ pub fn write_f32s(queue: &GpuQueue, buffer: &GpuBuffer, values: &[f32]) {
 /// @returns The same memory as `&[u8]`.
 pub fn f32_bytes(values: &[f32]) -> &[u8] {
     // SAFETY: f32→u8 is a Pod reinterpret; len*4 can't overflow.
-    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) }
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
 }
 
 // ── Bind groups ─────────────────────────────────────────────────────
 
 /// `uniform_entry` — a `@binding(n) var<uniform>` layout entry,
-/// FRAGMENT-visible (every widget reads uniforms in fs_main only).
+/// VERTEX+FRAGMENT visible — instanced widgets (text-draw, ring-sheen,
+/// burn, corner-brackets, media, scene3d) read uniforms in vs_main to
+/// place their quads; fragment-only visibility fails pipeline
+/// validation there.
 ///
 /// @param binding The @binding index in the WGSL.
 /// @returns The layout entry.
 pub fn uniform_entry(binding: u32) -> GpuBindGroupLayoutEntry {
-    let e = GpuBindGroupLayoutEntry::new(binding, gpu_shader_stage::FRAGMENT);
+    let e = GpuBindGroupLayoutEntry::new(
+        binding,
+        gpu_shader_stage::VERTEX | gpu_shader_stage::FRAGMENT,
+    );
     let l = GpuBufferBindingLayout::new();
     l.set_type(GpuBufferBindingType::Uniform);
     l.set_has_dynamic_offset(false);
@@ -170,13 +223,18 @@ pub fn uniform_entry(binding: u32) -> GpuBindGroupLayoutEntry {
     e
 }
 
-/// `storage_entry` — a `@binding(n) var<storage, read>` layout entry
-/// (the skeleton sheet is the only user today).
+/// `storage_entry` — a `@binding(n) var<storage, read>` layout entry,
+/// VERTEX+FRAGMENT visible — instanced sheets (text-draw chars,
+/// ring-sheen tiles, burn instances) are read in vs_main to place
+/// each record's quad.
 ///
 /// @param binding The @binding index in the WGSL.
 /// @returns The layout entry.
 pub fn storage_entry(binding: u32) -> GpuBindGroupLayoutEntry {
-    let e = GpuBindGroupLayoutEntry::new(binding, gpu_shader_stage::FRAGMENT);
+    let e = GpuBindGroupLayoutEntry::new(
+        binding,
+        gpu_shader_stage::VERTEX | gpu_shader_stage::FRAGMENT,
+    );
     let l = GpuBufferBindingLayout::new();
     l.set_type(GpuBufferBindingType::ReadOnlyStorage);
     l.set_has_dynamic_offset(false);
@@ -212,9 +270,16 @@ pub fn sampler_entry(binding: u32) -> GpuBindGroupLayoutEntry {
 ///
 /// @param device The factory device.
 /// @param entries Layout entries (see `uniform_entry` etc.).
-/// @returns The bind-group layout.
-pub fn new_layout(device: &GpuDevice, entries: &[GpuBindGroupLayoutEntry]) -> GpuBindGroupLayout {
-    device.create_bind_group_layout(&GpuBindGroupLayoutDescriptor::new(entries)).expect("create_bind_group_layout")
+/// @returns The bind-group layout, or Err so a device fault inside an
+///   async init surfaces as a JS rejection (the WebGL fallback path)
+///   instead of a wasm panic poisoning the glue closures.
+pub fn new_layout(
+    device: &GpuDevice,
+    entries: &[GpuBindGroupLayoutEntry],
+) -> Result<GpuBindGroupLayout, JsValue> {
+    device
+        .create_bind_group_layout(&GpuBindGroupLayoutDescriptor::new(entries))
+        .map_err(|e| JsValue::from_str(&format!("create_bind_group_layout: {e:?}")))
 }
 
 /// `bind_buffer_entry` — a bind-group entry pointing at a buffer.
@@ -272,13 +337,15 @@ pub fn new_bind_group(
 /// @param format Canvas format.
 /// @param wgsl The shader source.
 /// @param layouts Bind-group layouts (usually exactly one).
-/// @returns The compiled render pipeline.
+/// @returns The compiled render pipeline, or Err so the caller's init
+///   resolves to the WebGL/CSS fallback instead of panicking inside
+///   the async mount future (a wasm panic poisons the glue closures).
 pub fn fullscreen_pipeline(
     device: &GpuDevice,
     format: GpuTextureFormat,
     wgsl: &str,
     layouts: &[GpuBindGroupLayout],
-) -> GpuRenderPipeline {
+) -> Result<GpuRenderPipeline, JsValue> {
     let shader = device.create_shader_module(&GpuShaderModuleDescriptor::new(wgsl));
 
     let layout_arr: Vec<js_sys::JsNullable<GpuBindGroupLayout>> = layouts
@@ -308,7 +375,7 @@ pub fn fullscreen_pipeline(
     desc.set_fragment(&fragment);
     device
         .create_render_pipeline(&desc)
-        .expect("create_render_pipeline")
+        .map_err(|e| JsValue::from_str(&format!("create_render_pipeline: {e:?}")))
 }
 
 /// `linear_sampler` — the shared bilinear sampler for textured
@@ -329,14 +396,20 @@ pub fn linear_sampler(device: &GpuDevice) -> GpuSampler {
 // ── Textures ────────────────────────────────────────────────────────
 
 /// `new_texture` — an RGBA8 texture for widget uploads (flag halves,
-/// media frames). Usage = TEXTURE_BINDING | COPY_DST — bilinear samples
-/// a single level, no render-attachment needed.
+/// media frames). Usage = TEXTURE_BINDING | COPY_DST |
+/// RENDER_ATTACHMENT — the last bit is NOT for rendering into it:
+/// `copyExternalImageToTexture` validates its destination as
+/// CopyDst+RenderAttachment (Dawn: "Destination texture needs to have
+/// CopyDst and RenderAttachment usage"), so upload textures must
+/// declare both or every atlas copy silently no-ops.
 ///
 /// @param device The factory device.
 /// @param w Texture width px.
 /// @param h Texture height px.
-/// @returns The texture (single mip level).
-pub fn new_texture(device: &GpuDevice, w: u32, h: u32) -> GpuTexture {
+/// @returns The texture (single mip level), or Err on a device fault
+///   so callers fall back instead of panicking inside a wasm async
+///   future (which poisons the glue closures).
+pub fn new_texture(device: &GpuDevice, w: u32, h: u32) -> Result<GpuTexture, JsValue> {
     let size = [
         js_sys::Number::from(w),
         js_sys::Number::from(h),
@@ -346,9 +419,11 @@ pub fn new_texture(device: &GpuDevice, w: u32, h: u32) -> GpuTexture {
         .create_texture(&GpuTextureDescriptor::new(
             GpuTextureFormat::Rgba8unorm,
             &size,
-            gpu_texture_usage::TEXTURE_BINDING | gpu_texture_usage::COPY_DST,
+            gpu_texture_usage::TEXTURE_BINDING
+                | gpu_texture_usage::COPY_DST
+                | gpu_texture_usage::RENDER_ATTACHMENT,
         ))
-        .expect("create_texture")
+        .map_err(|e| JsValue::from_str(&format!("create_texture: {e:?}")))
 }
 
 /// `upload_rgba` — write a packed RGBA8 byte slice into a texture.
@@ -373,9 +448,12 @@ pub fn upload_rgba(queue: &GpuQueue, texture: &GpuTexture, w: u32, h: u32, rgba:
 /// `view` — a texture's default view (all mips, 2D) for binding.
 ///
 /// @param texture The texture.
-/// @returns Its view.
-pub fn view(texture: &GpuTexture) -> GpuTextureView {
-    texture.create_view().expect("create_view")
+/// @returns Its view, or Err on a device fault so callers skip the
+///   bind-group rebuild instead of panicking inside a wasm future.
+pub fn view(texture: &GpuTexture) -> Result<GpuTextureView, JsValue> {
+    texture
+        .create_view()
+        .map_err(|e| JsValue::from_str(&format!("create_view: {e:?}")))
 }
 
 /// `bitmap_texture` — create an RGBA8 texture and copy a decoded
@@ -388,15 +466,16 @@ pub fn view(texture: &GpuTexture) -> GpuTextureView {
 /// @param bitmap The decoded bitmap (JS `createImageBitmap`).
 /// @param w Bitmap width px.
 /// @param h Bitmap height px.
-/// @returns The populated texture.
+/// @returns The populated texture, or Err on a device fault so the
+///   caller keeps its previous texture instead of panicking.
 pub fn bitmap_texture(
     device: &GpuDevice,
     queue: &GpuQueue,
     bitmap: &ImageBitmap,
     w: u32,
     h: u32,
-) -> GpuTexture {
-    let tex = new_texture(device, w.max(1), h.max(1));
+) -> Result<GpuTexture, JsValue> {
+    let tex = new_texture(device, w.max(1), h.max(1))?;
 
     let src = GpuCopyExternalImageSourceInfo::new(bitmap);
     let dest = GpuCopyExternalImageDestInfo::new(&tex);
@@ -404,7 +483,7 @@ pub fn bitmap_texture(
     size.set_height(h.max(1));
 
     let _ = queue.copy_external_image_to_texture_with_gpu_extent_3d_dict(&src, &dest, &size);
-    tex
+    Ok(tex)
 }
 
 // ── Widget scaffold ─────────────────────────────────────────────────
@@ -425,21 +504,27 @@ pub struct Widget {
 }
 
 /// `init_widget` — surface + layout(binding 0 uniform) + pipeline +
-/// uniform buffer + bind group, in one call.
+/// uniform buffer + bind group, in one call. Sync: the shared
+/// GPUDevice arrives from the JS bridge — nothing to await.
 ///
 /// @param canvas The widget's dedicated canvas.
+/// @param device The shared GPUDevice.
 /// @param wgsl The widget's shader.
 /// @returns A ready `Widget`, or Err for the JS fallback path.
-pub async fn init_widget(canvas: &HtmlCanvasElement, wgsl: &str) -> Result<Widget, JsValue> {
-    let surface = init_surface(canvas).await?;
+pub fn init_widget(
+    canvas: &HtmlCanvasElement,
+    device: &GpuDevice,
+    wgsl: &str,
+) -> Result<Widget, JsValue> {
+    let surface = init_surface(canvas, device)?;
 
-    let layout = new_layout(&surface.device, &[uniform_entry(0)]);
-    let pipeline = fullscreen_pipeline(&surface.device, surface.format, wgsl, &[layout.clone()]);
+    let layout = new_layout(&surface.device, &[uniform_entry(0)])?;
+    let pipeline = fullscreen_pipeline(&surface.device, surface.format, wgsl, &[layout.clone()])?;
     let ubuf = new_buffer(
         &surface.device,
         256,
         gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST,
-    );
+    )?;
     let bind = new_bind_group(&surface.device, &layout, &[bind_buffer_entry(0, &ubuf)]);
 
     Ok(Widget {

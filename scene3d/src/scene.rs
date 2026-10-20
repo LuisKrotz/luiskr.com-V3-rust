@@ -210,9 +210,7 @@ impl Scene {
         }
 
         if let Some(p) = self.nodes[id.0 as usize].parent.take() {
-            self.nodes[p.0 as usize]
-                .children
-                .retain(|&c| c != id);
+            self.nodes[p.0 as usize].children.retain(|&c| c != id);
         }
 
         // Tombstone: invisible + nonexistent kind so every query skips.
@@ -375,7 +373,9 @@ impl Scene {
     pub fn set_instance(&mut self, id: NodeId, i: u32, m: Mat4) {
         let n = &mut self.nodes[id.0 as usize];
 
-        if n.instances.len() <= i as usize { n.instances.resize(i as usize + 1, Mat4::IDENTITY); }
+        if n.instances.len() <= i as usize {
+            n.instances.resize(i as usize + 1, Mat4::IDENTITY);
+        }
 
         n.instances[i as usize] = m;
         n.inst_version = n.inst_version.wrapping_add(1);

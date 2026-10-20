@@ -29,18 +29,10 @@ impl Theme {
     /// neutral value (the bridge always sends all keys — the fallbacks
     /// exist so a hand-rolled caller still gets a readable diagram).
     pub fn from_json(json: &str) -> Theme {
-        let v: serde_json::Value =
-            serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
+        let v: serde_json::Value = serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
 
-        let s = |k: &str, d: &str| {
-            v.get(k)
-                .and_then(|x| x.as_str())
-                .unwrap_or(d)
-                .to_string()
-        };
-        let n = |k: &str, d: f32| {
-            v.get(k).and_then(|x| x.as_f64()).unwrap_or(d as f64) as f32
-        };
+        let s = |k: &str, d: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or(d).to_string();
+        let n = |k: &str, d: f32| v.get(k).and_then(|x| x.as_f64()).unwrap_or(d as f64) as f32;
 
         Theme {
             font: s("font", "sans-serif"),

@@ -37,7 +37,7 @@
 
 use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
-use web_sys::{gpu_buffer_usage, HtmlCanvasElement};
+use web_sys::{gpu_buffer_usage, GpuDevice, HtmlCanvasElement};
 
 /// WGSL — the "data decoding" glyph field. Byte-identical to
 /// `rust/overlay/src/widgets/skeleton.wgsl` — see SYNC CONTRACT above.
@@ -126,37 +126,38 @@ impl Skeleton {
     /// propagates to JS, which falls back to the WebGL/CSS skeleton.
     ///
     /// @param canvas The dedicated canvas this surface paints.
+    /// @param device The shared GPUDevice (one per page, from the JS bridge).
     /// @returns Ok on a configured surface, Err(JsValue) on failure.
-    pub async fn init(&self, canvas: HtmlCanvasElement) -> Result<(), JsValue> {
-        let surface = gpu_mini::init_surface(&canvas).await?;
+    pub fn init(&self, canvas: HtmlCanvasElement, device: GpuDevice) -> Result<(), JsValue> {
+        let surface = gpu_mini::init_surface(&canvas, &device)?;
 
         // Layout: binding 0 uniform, binding 1 read-only storage sheet
         // — identical to the WGSL's @binding declarations.
         let layout = gpu_mini::new_layout(
             &surface.device,
             &[gpu_mini::uniform_entry(0), gpu_mini::storage_entry(1)],
-        );
+        )?;
 
         let pipeline = gpu_mini::fullscreen_pipeline(
             &surface.device,
             surface.format,
             WGSL,
             &[layout.clone()],
-        );
+        )?;
 
         // 256 B covers the 48 B block with alignment headroom.
         let ubuf = gpu_mini::new_buffer(
             &surface.device,
             256,
             gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST,
-        );
+        )?;
 
         // The sheet: 24 rects × 4 vec4s × 16 B = 1536 B.
         let sheet = gpu_mini::new_buffer(
             &surface.device,
             (SHEET_VEC4S * 16) as u32,
             gpu_buffer_usage::STORAGE | gpu_buffer_usage::COPY_DST,
-        );
+        )?;
 
         let bind = gpu_mini::new_bind_group(
             &surface.device,
@@ -167,7 +168,13 @@ impl Skeleton {
             ],
         );
 
-        *self.gpu.borrow_mut() = Some(Gpu {
+        // try_borrow everywhere: a JS exception that crossed a wasm
+        // frame mid-call leaks the RefCell guard (wasm has no
+        // unwinding) — a later borrow() then panics `unreachable`.
+        let Ok(mut slot) = self.gpu.try_borrow_mut() else {
+            return Err(JsValue::from_str("init: gpu slot poisoned"));
+        };
+        *slot = Some(Gpu {
             surface,
             pipeline,
             ubuf,
@@ -185,9 +192,16 @@ impl Skeleton {
     /// @param w Device-pixel width (element CSS px × DPR).
     /// @param h Device-pixel height.
     pub fn resize(&self, w: u32, h: u32) {
-        self.state.borrow_mut().dev = [(w.max(1)) as f32, (h.max(1)) as f32];
+        let Ok(mut s) = self.state.try_borrow_mut() else {
+            return;
+        };
 
-        let gpu = self.gpu.borrow();
+        s.dev = [(w.max(1)) as f32, (h.max(1)) as f32];
+        drop(s);
+
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return;
+        };
 
         if let Some(g) = gpu.as_ref() {
             gpu_mini::resize(&g.surface);
@@ -201,7 +215,9 @@ impl Skeleton {
     /// @param w Canvas width in CSS pixels.
     /// @param h Canvas height in CSS pixels.
     pub fn set_size(&self, w: f32, h: f32) {
-        self.state.borrow_mut().css = [w.max(1.0), h.max(1.0)];
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.css = [w.max(1.0), h.max(1.0)];
+        }
     }
 
     /// `write_sheet` — upload the per-rect data block: 16 f32s per
@@ -211,7 +227,9 @@ impl Skeleton {
     ///
     /// @param values Flat f32 sheet — 16 values per rect row.
     pub fn write_sheet(&self, values: &[f32]) {
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return;
+        };
 
         if let Some(g) = gpu.as_ref() {
             gpu_mini::write_f32s(&g.surface.queue, &g.sheet, values);
@@ -225,7 +243,9 @@ impl Skeleton {
     /// @param ink_alpha Global glyph opacity multiplier.
     /// @param count Live rect count, clamped to MAX_RECTS.
     pub fn set_state(&self, resolve: f32, ink_alpha: f32, count: f32) {
-        let mut s = self.state.borrow_mut();
+        let Ok(mut s) = self.state.try_borrow_mut() else {
+            return;
+        };
 
         s.resolve = resolve.clamp(0.0, 1.0);
         s.ink_alpha = ink_alpha.clamp(0.0, 1.0);
@@ -238,7 +258,9 @@ impl Skeleton {
     ///
     /// @param dt Seconds since the previous `frame` call.
     pub fn frame(&self, dt: f32) {
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return;
+        };
 
         let Some(g) = gpu.as_ref() else {
             return;
@@ -246,7 +268,9 @@ impl Skeleton {
 
         self.clock.set(self.clock.get() + dt);
 
-        let s = self.state.borrow();
+        let Ok(s) = self.state.try_borrow() else {
+            return;
+        };
 
         // Uniform block — field-for-field the WGSL `Uniforms` struct:
         //   [0,1] res (CSS px)   [2] time   [3] resolve   [4] ink_alpha
@@ -275,6 +299,20 @@ impl Skeleton {
             // Lost/stale surface (resize mid-frame, occluded tab) —
             // re-configure so the next rAF recovers.
             gpu_mini::resize(&g.surface);
+        }
+    }
+}
+
+/// `Drop` — forget the GPU state instead of destructing it: the JS
+/// FinalizationRegistry's `__wbg_skeleton_free` would otherwise walk
+/// every stored JsValue's externref dealloc — on a torn-down table
+/// that walk traps `memory access out of bounds` during GC. GPU
+/// objects die with the shared device; leaking the handles is both
+/// safe and un-panickable.
+impl Drop for Skeleton {
+    fn drop(&mut self) {
+        if let Some(g) = self.gpu.get_mut().take() {
+            std::mem::forget(g);
         }
     }
 }

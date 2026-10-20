@@ -26,7 +26,7 @@
 
 use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
-use web_sys::HtmlCanvasElement;
+use web_sys::{GpuDevice, HtmlCanvasElement};
 
 /// WGSL — double-domain-warped fbm contour field.
 const WGSL: &str = include_str!("menu_background.wgsl");
@@ -86,9 +86,21 @@ impl MenuBackground {
     /// backdrop; mounting can never regress the page.
     ///
     /// @param canvas The widget's dedicated canvas.
+    /// @param device The shared GPUDevice (one per page, from the JS bridge).
     /// @returns Ok on a live surface, Err(JsValue) on failure.
-    pub async fn init(&self, canvas: HtmlCanvasElement) -> Result<(), JsValue> {
-        *self.gpu.borrow_mut() = Some(gpu_mini::init_widget(&canvas, WGSL).await?);
+    pub fn init(&self, canvas: HtmlCanvasElement, device: GpuDevice) -> Result<(), JsValue> {
+        // try_borrow everywhere: a JS exception crossing a wasm frame
+        // mid-call leaks the RefCell guard — a later borrow() panics
+        // `unreachable` (the observed widget-crash cascade). Build the
+        // GPU state BEFORE taking the guard so the fallible JS-boundary
+        // calls can never run while the borrow is held.
+        let built = gpu_mini::init_widget(&canvas, &device, WGSL)?;
+
+        let Ok(mut slot) = self.gpu.try_borrow_mut() else {
+            return Err(JsValue::from_str("init: gpu slot poisoned"));
+        };
+
+        *slot = Some(built);
         Ok(())
     }
 
@@ -97,9 +109,13 @@ impl MenuBackground {
     /// @param _w Device-pixel width (element-side).
     /// @param _h Device-pixel height.
     pub fn resize(&self, w: u32, h: u32) {
-        self.state.borrow_mut().dev = [(w.max(1)) as f32, (h.max(1)) as f32];
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.dev = [(w.max(1)) as f32, (h.max(1)) as f32];
+        }
 
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return;
+        };
 
         if let Some(w) = gpu.as_ref() {
             gpu_mini::resize(&w.surface);
@@ -111,7 +127,9 @@ impl MenuBackground {
     /// @param w Canvas width in CSS pixels.
     /// @param h Canvas height in CSS pixels.
     pub fn set_size(&self, w: f32, h: f32) {
-        self.state.borrow_mut().css = [w.max(1.0), h.max(1.0)];
+        if let Ok(mut s) = self.state.try_borrow_mut() {
+            s.css = [w.max(1.0), h.max(1.0)];
+        }
     }
 
     /// `set_state` — bundled scalar update: reveal amount, the two
@@ -136,7 +154,9 @@ impl MenuBackground {
         g2: f32,
         b2: f32,
     ) {
-        let mut s = self.state.borrow_mut();
+        let Ok(mut s) = self.state.try_borrow_mut() else {
+            return;
+        };
 
         s.reveal = reveal.clamp(0.0, 1.0);
         s.color = [r1, g1, b1];
@@ -148,7 +168,9 @@ impl MenuBackground {
     ///
     /// @param dt Seconds since the previous call.
     pub fn frame(&self, dt: f32) {
-        let gpu = self.gpu.borrow();
+        let Ok(gpu) = self.gpu.try_borrow() else {
+            return;
+        };
 
         let Some(w) = gpu.as_ref() else {
             return;
@@ -156,7 +178,9 @@ impl MenuBackground {
 
         self.clock.set(self.clock.get() + dt);
 
-        let s = self.state.borrow();
+        let Ok(s) = self.state.try_borrow() else {
+            return;
+        };
 
         // [0] time [1,2] res [3] reveal [4..6] color [7] alpha
         // [8..10] color2 [11] pad [12..15] rect = (0,0,w,h)
@@ -183,6 +207,19 @@ impl MenuBackground {
 
         if !gpu_mini::widget_frame(w, &uniforms) {
             gpu_mini::resize(&w.surface);
+        }
+    }
+}
+
+/// `destroy` parity — forget the GPU state instead of destructing
+/// it: the FinalizationRegistry's `__wbg_*_free` walks every stored
+/// JsValue's externref dealloc — on a torn-down table that traps
+/// `memory access out of bounds` during GC. GPU objects die with the
+/// shared device; leaking the handles is safe and un-panickable.
+impl Drop for MenuBackground {
+    fn drop(&mut self) {
+        if let Some(g) = self.gpu.get_mut().take() {
+            std::mem::forget(g);
         }
     }
 }
