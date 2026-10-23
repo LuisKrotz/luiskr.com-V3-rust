@@ -248,7 +248,11 @@ impl Renderer {
     ///
     /// @param w @param h New device-px backing size.
     pub fn resize(&mut self, w: u32, h: u32) {
-        if (w, h) == self.size {
+        // Same-size calls normally early-out, but a prior depth bake
+        // that failed (device fault → depth None) must retry — without
+        // the is_some() check the surface would skip every frame
+        // forever, silently.
+        if (w, h) == self.size && self.depth.is_some() {
             return;
         }
 
