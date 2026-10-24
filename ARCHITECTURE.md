@@ -372,11 +372,11 @@ hover-out replay exactly.
    hidden-tab pauses the loop; destroy() reaps everything.
 ```
 
-Legacy browsers (Safari < 26, Chrome < 113, Firefox < 141, IE10/11,
-old iOS) never reach the wasm path — they get the DOM/canvas-2D/WebGL
-fallbacks that already exist, plus the legacy tier bundles the build
-emits (`dist/v/es2016`/`es2017`/`ie`). The artifacts never ship to
-them, so they pay nothing; modern browsers get the full GPU path.
+Browsers below the ES2022 floor (pre-iOS 16 engines, legacy Edge, IE)
+never reach the wasm path — the inline loader's probes fail every tier
+and they get the fallback notice plus the DOM/canvas-2D/WebGL fallbacks
+that already exist. The wasm artifacts never ship to them, so they pay
+nothing; supported browsers get the full GPU path.
 
 ---
 
