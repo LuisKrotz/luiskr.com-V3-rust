@@ -667,6 +667,59 @@ fn border(n: &Node, tx: f32, ty: f32) -> (f32, f32) {
     (n.x + dx * s, n.y + dy * s)
 }
 
+/// Clearance kept between an edge-label chip and every node box, px —
+/// without it a chip may hug a border hard enough to read as part of
+/// the node.
+const LABEL_CLEAR: f32 = 4.0;
+
+/// True when a chip centered at (cx,cy) sized (w,h) clears every node
+/// by LABEL_CLEAR. Axis-aligned test — diamond/subroutine shapes keep
+/// their rect bounds (conservative: the chip may sit slightly further
+/// off a diamond than strictly needed, never inside it).
+fn chip_free(g: &Graph, cx: f32, cy: f32, w: f32, h: f32) -> bool {
+    g.nodes.values().all(|n| {
+        cx + w / 2.0 + LABEL_CLEAR <= n.x - n.w / 2.0
+            || cx - w / 2.0 - LABEL_CLEAR >= n.x + n.w / 2.0
+            || cy + h / 2.0 + LABEL_CLEAR <= n.y - n.h / 2.0
+            || cy - h / 2.0 - LABEL_CLEAR >= n.y + h / 2.0
+    })
+}
+
+/// Where an edge's label chip goes. The midpoint is the mermaid
+/// default, but skip-level edges (rank n → n+2 or longer) pass through
+/// intervening nodes, and a chip dropped at the midpoint lands on top
+/// of a box. The search slides the chip along the clipped edge
+/// (border→border) in widening steps off the midpoint — staying ON
+/// the edge so the label still reads as belonging to that edge — and
+/// takes the first spot whose chip clears every node. Endpoints are
+/// not exempted: a chip hugging its own source/target box fails the
+/// test too, which naturally pushes labels into the open rank gap.
+/// Fallback is the midpoint itself when no candidate clears (dense
+/// graphs) — a worst-case label-on-box beats a dropped label.
+fn label_pos(g: &Graph, a: &Node, b: &Node, lw: f32, lh: f32) -> (f32, f32) {
+    let (x1, y1) = border(a, b.x, b.y);
+    let (x2, y2) = border(b, a.x, a.y);
+    // Alternating offsets around 0.5 so the nearest free spot wins —
+    // 0.5 is listed first and is also the fallback.
+    const T: [f32; 11] = [0.5, 0.62, 0.38, 0.74, 0.26, 0.86, 0.14, 0.94, 0.06, 0.98, 0.02];
+    let mut mid = (0.0f32, 0.0f32);
+
+    for t in T {
+        let cx = x1 + (x2 - x1) * t;
+        let cy = y1 + (y2 - y1) * t;
+
+        if t == 0.5 {
+            mid = (cx, cy);
+        }
+
+        if chip_free(g, cx, cy, lw, lh) {
+            return (cx, cy);
+        }
+    }
+
+    mid
+}
+
 /// Draws a node shape centered at (n.x, n.y).
 fn draw_node(out: &mut String, n: &Node, theme: &Theme) {
     let x = n.x - n.w / 2.0;
@@ -747,6 +800,28 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
     rank(&mut g);
     layout(&mut g, theme);
 
+    // Label chip centers — computed once (they need the clipped edge
+    // endpoints AND the laid-out node grid for the collision test) so
+    // the painted-bounds pass and the draw pass agree on where every
+    // label lands. Parallel to `g.edges`; None for self-edges and
+    // unlabeled edges.
+    let label_centers: Vec<Option<(f32, f32)>> = g
+        .edges
+        .iter()
+        .map(|e| {
+            if e.from == e.to || e.label.is_empty() {
+                return None;
+            }
+
+            let (Some(a), Some(b)) = (g.nodes.get(&e.from), g.nodes.get(&e.to)) else {
+                return None;
+            };
+            let (lw, lh) = svg::label_size(&e.label, theme);
+
+            Some(label_pos(&g, a, b, lw, lh))
+        })
+        .collect();
+
     // Painted bounds — groups may exceed node bounds on the label side;
     // edge-label chips and self-edge loops can overshoot every side, so
     // the extents fold them in too. A negative min corner becomes the
@@ -772,8 +847,8 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
     for grp in &g.groups {
         grow(grp.x, grp.y, grp.x + grp.w, grp.y + grp.h);
     }
-    for e in &g.edges {
-        let (Some(a), Some(b)) = (g.nodes.get(&e.from), g.nodes.get(&e.to)) else {
+    for (i, e) in g.edges.iter().enumerate() {
+        let (Some(a), Some(_b)) = (g.nodes.get(&e.from), g.nodes.get(&e.to)) else {
             continue;
         };
 
@@ -791,10 +866,10 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
             continue;
         }
 
-        let (x1, y1) = border(a, b.x, b.y);
-        let (x2, y2) = border(b, a.x, a.y);
+        let Some((mx, my)) = label_centers[i] else {
+            continue;
+        };
         let (lw, lh) = svg::label_size(&e.label, theme);
-        let (mx, my) = ((x1 + x2) / 2.0, (y1 + y2) / 2.0);
 
         grow(mx - lw / 2.0, my - lh / 2.0, mx + lw / 2.0, my + lh / 2.0);
     }
@@ -830,7 +905,7 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
         );
     }
 
-    for e in &g.edges {
+    for (i, e) in g.edges.iter().enumerate() {
         let (Some(a), Some(b)) = (g.nodes.get(&e.from), g.nodes.get(&e.to)) else {
             continue;
         };
@@ -869,8 +944,8 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
             svg::arrow_head(&mut out, x2, y2, x2 - x1, y2 - y1, theme);
         }
 
-        if !e.label.is_empty() {
-            svg::label_chip(&mut out, (x1 + x2) / 2.0, (y1 + y2) / 2.0, &e.label, theme);
+        if let Some((mx, my)) = label_centers[i] {
+            svg::label_chip(&mut out, mx, my, &e.label, theme);
         }
     }
 
@@ -881,4 +956,122 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
     out.push_str("</svg>");
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Neutral theme for layout tests — colors are irrelevant to the
+    /// geometry under test; font size drives all box measurements.
+    fn theme() -> Theme {
+        Theme {
+            font: "sans-serif".into(),
+            font_size: 14.0,
+            fg: "#fff".into(),
+            bg: "#111".into(),
+            line: "#ccc".into(),
+            accent: "#ccc".into(),
+            surface: "#000".into(),
+        }
+    }
+
+    /// The docs "where compute runs" diagram — TD flowchart whose two
+    /// skip-level edges (B→C over W, G→C over W+rows) used to drop
+    /// their labels at midpoints inside the WASM node box.
+    const SKIP_LEVEL_SRC: &str = r#"flowchart TD
+    Q["animation channel"] --> A{"per-frame, per-pixel/vertex?"}
+    A -->|"yes"| G["GPU — WebGPU TSL nodes / GLSL shaders"]
+    A -->|"no — batch math"| B{"heavy + parallelizable?"}
+    B -->|"yes"| W["WASM worker pool — wasm-pool.ts"]
+    B -->|"no"| C["JS on main thread — synchronous"]
+
+    G -.->|"probe fails / energy-saver"| C
+    W -.->|"no wasm / no worker"| C
+"#;
+
+    #[test]
+    fn labelled_edges_place_chips_clear_of_every_node() {
+        let theme = theme();
+        let mut g = parse(SKIP_LEVEL_SRC);
+
+        rank(&mut g);
+        layout(&mut g, &theme);
+
+        for e in &g.edges {
+            if e.from == e.to || e.label.is_empty() {
+                continue;
+            }
+
+            let a = &g.nodes[&e.from];
+            let b = &g.nodes[&e.to];
+            let (lw, lh) = svg::label_size(&e.label, &theme);
+            let (cx, cy) = label_pos(&g, a, b, lw, lh);
+
+            assert!(
+                chip_free(&g, cx, cy, lw, lh),
+                "label {:?} on {} -> {} overlaps a node at ({cx:.1},{cy:.1})",
+                e.label,
+                e.from,
+                e.to,
+            );
+        }
+    }
+
+    #[test]
+    fn skip_level_labels_slide_off_the_midpoint() {
+        let theme = theme();
+        let mut g = parse(SKIP_LEVEL_SRC);
+
+        rank(&mut g);
+        layout(&mut g, &theme);
+
+        // B → C crosses the whole W row: the naive midpoint sits inside
+        // W's rect, so the picked spot must differ from it (the exact
+        // step is an implementation detail — moving is the contract).
+        let e = g
+            .edges
+            .iter()
+            .find(|e| e.from == "B" && e.to == "C")
+            .expect("B -> C edge exists");
+        let a = &g.nodes["B"];
+        let b = &g.nodes["C"];
+        let (lw, lh) = svg::label_size(&e.label, &theme);
+        let (cx, cy) = label_pos(&g, a, b, lw, lh);
+        let (x1, y1) = border(a, b.x, b.y);
+        let (x2, y2) = border(b, a.x, a.y);
+
+        assert!(
+            (cx - (x1 + x2) / 2.0).abs() > 0.5 || (cy - (y1 + y2) / 2.0).abs() > 0.5,
+            "B -> C label stayed on the colliding midpoint"
+        );
+    }
+
+    #[test]
+    fn adjacent_rank_labels_keep_the_midpoint() {
+        let theme = theme();
+        let mut g = parse(SKIP_LEVEL_SRC);
+
+        rank(&mut g);
+        layout(&mut g, &theme);
+
+        // B → W is a single-rank step — nothing between the endpoints,
+        // so midpoint placement survives (minimal label drift).
+        let a = &g.nodes["B"];
+        let b = &g.nodes["W"];
+        let e = g
+            .edges
+            .iter()
+            .find(|e| e.from == "B" && e.to == "W")
+            .expect("B -> W edge exists");
+        let (lw, lh) = svg::label_size(&e.label, &theme);
+        let (cx, cy) = label_pos(&g, a, b, lw, lh);
+        let (x1, y1) = border(a, b.x, b.y);
+        let (x2, y2) = border(b, a.x, a.y);
+
+        assert!(
+            (cx - (x1 + x2) / 2.0).abs() <= 0.5 && (cy - (y1 + y2) / 2.0).abs() <= 0.5,
+            "B -> W label drifted off a clear midpoint"
+        );
+    }
 }
