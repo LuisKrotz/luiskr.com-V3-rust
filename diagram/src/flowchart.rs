@@ -35,11 +35,14 @@ use std::collections::HashMap;
 
 /// Gap between rank columns (LR) / rows (TD), px. Raising it spreads
 /// the diagram along the flow axis; too low and edge labels collide.
-const RANK_GAP: f32 = 72.0;
+/// 96px keeps a labelled chip + clearance between adjacent rank boxes —
+/// the 72px setting packed label chips against their endpoint borders.
+const RANK_GAP: f32 = 96.0;
 
 /// Gap between siblings inside a rank, px. Vertical breathing room in
-/// LR mode; raising it makes fan-outs taller, not wider.
-const SIB_GAP: f32 = 48.0;
+/// LR mode; raising it makes fan-outs taller, not wider. 64px keeps
+/// stacked boxes + passing edge labels visually distinct.
+const SIB_GAP: f32 = 64.0;
 
 /// Padding inside a subgraph cluster box around its children, px.
 const GROUP_PAD: f32 = 22.0;
@@ -670,18 +673,50 @@ fn border(n: &Node, tx: f32, ty: f32) -> (f32, f32) {
 /// Clearance kept between an edge-label chip and every node box, px —
 /// without it a chip may hug a border hard enough to read as part of
 /// the node.
-const LABEL_CLEAR: f32 = 4.0;
+const LABEL_CLEAR: f32 = 8.0;
+
+/// Axis-aligned overlap test — true when the two rects (half-extent
+/// form) intersect within `clear` px of each other.
+fn rects_touch(
+    ax: f32,
+    ay: f32,
+    aw: f32,
+    ah: f32,
+    bx: f32,
+    by: f32,
+    bw: f32,
+    bh: f32,
+    clear: f32,
+) -> bool {
+    !(ax + aw / 2.0 + clear <= bx - bw / 2.0
+        || ax - aw / 2.0 - clear >= bx + bw / 2.0
+        || ay + ah / 2.0 + clear <= by - bh / 2.0
+        || ay - ah / 2.0 - clear >= by + bh / 2.0)
+}
 
 /// True when a chip centered at (cx,cy) sized (w,h) clears every node
-/// by LABEL_CLEAR. Axis-aligned test — diamond/subroutine shapes keep
-/// their rect bounds (conservative: the chip may sit slightly further
-/// off a diamond than strictly needed, never inside it).
-fn chip_free(g: &Graph, cx: f32, cy: f32, w: f32, h: f32) -> bool {
+/// by LABEL_CLEAR AND every already-placed label chip. Axis-aligned
+/// test — diamond/subroutine shapes keep their rect bounds
+/// (conservative: the chip may sit slightly further off a diamond than
+/// strictly needed, never inside it). The chip-vs-chip check matters:
+/// chips are emitted in edge order and paint over earlier chips —
+/// without it two labels converging on one node overlap and the first
+/// renders as clipped text ("prob").
+fn chip_free(g: &Graph, placed: &[(f32, f32, f32, f32)], cx: f32, cy: f32, w: f32, h: f32) -> bool {
     g.nodes.values().all(|n| {
-        cx + w / 2.0 + LABEL_CLEAR <= n.x - n.w / 2.0
-            || cx - w / 2.0 - LABEL_CLEAR >= n.x + n.w / 2.0
-            || cy + h / 2.0 + LABEL_CLEAR <= n.y - n.h / 2.0
-            || cy - h / 2.0 - LABEL_CLEAR >= n.y + h / 2.0
+        !rects_touch(cx, cy, w, h, n.x, n.y, n.w, n.h, LABEL_CLEAR)
+    }) && placed.iter().all(|&(px0, py0, px1, py1)| {
+        !rects_touch(
+            cx,
+            cy,
+            w,
+            h,
+            (px0 + px1) / 2.0,
+            (py0 + py1) / 2.0,
+            px1 - px0,
+            py1 - py0,
+            LABEL_CLEAR / 2.0,
+        )
     })
 }
 
@@ -696,28 +731,104 @@ fn chip_free(g: &Graph, cx: f32, cy: f32, w: f32, h: f32) -> bool {
 /// test too, which naturally pushes labels into the open rank gap.
 /// Fallback is the midpoint itself when no candidate clears (dense
 /// graphs) — a worst-case label-on-box beats a dropped label.
-fn label_pos(g: &Graph, a: &Node, b: &Node, lw: f32, lh: f32) -> (f32, f32) {
+/// `placed` carries the rects of chips already claimed this render so
+/// converging labels slide instead of stacking.
+fn label_pos(
+    g: &Graph,
+    placed: &[(f32, f32, f32, f32)],
+    a: &Node,
+    b: &Node,
+    lw: f32,
+    lh: f32,
+) -> (f32, f32) {
     let (x1, y1) = border(a, b.x, b.y);
     let (x2, y2) = border(b, a.x, a.y);
     // Alternating offsets around 0.5 so the nearest free spot wins —
     // 0.5 is listed first and is also the fallback.
     const T: [f32; 11] = [0.5, 0.62, 0.38, 0.74, 0.26, 0.86, 0.14, 0.94, 0.06, 0.98, 0.02];
+    // Lateral sidesteps (px, perpendicular to the edge) tried at each
+    // t — converging labels (two edges → one node) crowd the same
+    // midpoint, and sliding ALONG a short edge runs out of room. A
+    // small perpendicular step keeps the chip beside its own edge
+    // while escaping the pile; 0 first keeps on-edge placement free.
+    const LAT: [f32; 7] = [0.0, 18.0, -18.0, 34.0, -34.0, 48.0, -48.0];
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len = (dx * dx + dy * dy).sqrt().max(0.001);
+    let (px, py) = (-dy / len, dx / len);
     let mut mid = (0.0f32, 0.0f32);
 
     for t in T {
-        let cx = x1 + (x2 - x1) * t;
-        let cy = y1 + (y2 - y1) * t;
+        for lat in LAT {
+            let cx = x1 + dx * t + px * lat;
+            let cy = y1 + dy * t + py * lat;
 
-        if t == 0.5 {
-            mid = (cx, cy);
-        }
+            if t == 0.5 && lat == 0.0 {
+                mid = (cx, cy);
+            }
 
-        if chip_free(g, cx, cy, lw, lh) {
-            return (cx, cy);
+            if chip_free(g, placed, cx, cy, lw, lh) {
+                return (cx, cy);
+            }
         }
     }
 
     mid
+}
+
+/// Computes every labelled edge's chip center — parallel to `g.edges`,
+/// None for self-edges, unlabeled edges, and dangling references.
+/// Placement order matters: labels on the SHORTEST edges go first —
+/// a short edge offers few candidate spots along its clipped span, so
+/// its label claims room before long-edge labels (with a whole edge
+/// to roam) take a spot that starves it. `placed` accumulates claimed
+/// chip rects so a later label never lands on top of an earlier one
+/// (chips paint in edge order — the second would cover the first's
+/// text).
+fn place_labels(g: &Graph, theme: &Theme) -> Vec<Option<(f32, f32)>> {
+    let mut centers: Vec<Option<(f32, f32)>> = vec![None; g.edges.len()];
+    let mut placed: Vec<(f32, f32, f32, f32)> = Vec::new();
+    // Edge length = clipped border→border distance; unlabeled/self/
+    // missing edges get +∞ so they sort last.
+    let edge_len = |i: usize| -> f32 {
+        let e = &g.edges[i];
+
+        if e.from == e.to || e.label.is_empty() {
+            return f32::MAX;
+        }
+
+        let (Some(a), Some(b)) = (g.nodes.get(&e.from), g.nodes.get(&e.to)) else {
+            return f32::MAX;
+        };
+        let (x1, y1) = border(a, b.x, b.y);
+        let (x2, y2) = border(b, a.x, a.y);
+        let dx = x2 - x1;
+        let dy = y2 - y1;
+
+        (dx * dx + dy * dy).sqrt()
+    };
+    let mut order: Vec<usize> = (0..g.edges.len()).collect();
+
+    order.sort_by(|&i, &j| edge_len(i).partial_cmp(&edge_len(j)).unwrap_or(std::cmp::Ordering::Equal));
+
+    for &i in &order {
+        let e = &g.edges[i];
+
+        if e.from == e.to || e.label.is_empty() {
+            continue;
+        }
+
+        let (Some(a), Some(b)) = (g.nodes.get(&e.from), g.nodes.get(&e.to)) else {
+            continue;
+        };
+        let (lw, lh) = svg::label_size(&e.label, theme);
+        let (cx, cy) = label_pos(g, &placed, a, b, lw, lh);
+
+        placed.push((cx - lw / 2.0, cy - lh / 2.0, cx + lw / 2.0, cy + lh / 2.0));
+        centers[i] = Some((cx, cy));
+    }
+
+    centers
 }
 
 /// Draws a node shape centered at (n.x, n.y).
@@ -805,22 +916,7 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
     // the painted-bounds pass and the draw pass agree on where every
     // label lands. Parallel to `g.edges`; None for self-edges and
     // unlabeled edges.
-    let label_centers: Vec<Option<(f32, f32)>> = g
-        .edges
-        .iter()
-        .map(|e| {
-            if e.from == e.to || e.label.is_empty() {
-                return None;
-            }
-
-            let (Some(a), Some(b)) = (g.nodes.get(&e.from), g.nodes.get(&e.to)) else {
-                return None;
-            };
-            let (lw, lh) = svg::label_size(&e.label, theme);
-
-            Some(label_pos(&g, a, b, lw, lh))
-        })
-        .collect();
+    let label_centers = place_labels(&g, theme);
 
     // Painted bounds — groups may exceed node bounds on the label side;
     // edge-label chips and self-edge loops can overshoot every side, so
@@ -990,6 +1086,23 @@ mod tests {
     W -.->|"no wasm / no worker"| C
 "#;
 
+    /// Runs the real `place_labels` pass — returns (center, size,
+    /// source edge) per labelled edge for collision assertions.
+    fn placed_labels(g: &Graph, theme: &Theme) -> Vec<((f32, f32), (f32, f32), String)> {
+        let centers = place_labels(g, theme);
+
+        g.edges
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                let (cx, cy) = centers[i]?;
+                let (lw, lh) = svg::label_size(&e.label, theme);
+
+                Some(((cx, cy), (lw, lh), format!("{} -> {}", e.from, e.to)))
+            })
+            .collect()
+    }
+
     #[test]
     fn labelled_edges_place_chips_clear_of_every_node() {
         let theme = theme();
@@ -998,23 +1111,37 @@ mod tests {
         rank(&mut g);
         layout(&mut g, &theme);
 
-        for e in &g.edges {
-            if e.from == e.to || e.label.is_empty() {
-                continue;
-            }
+        let labels = placed_labels(&g, &theme);
 
-            let a = &g.nodes[&e.from];
-            let b = &g.nodes[&e.to];
-            let (lw, lh) = svg::label_size(&e.label, &theme);
-            let (cx, cy) = label_pos(&g, a, b, lw, lh);
-
+        for ((cx, cy), (lw, lh), edge) in &labels {
             assert!(
-                chip_free(&g, cx, cy, lw, lh),
-                "label {:?} on {} -> {} overlaps a node at ({cx:.1},{cy:.1})",
-                e.label,
-                e.from,
-                e.to,
+                g.nodes.values().all(|n| !rects_touch(
+                    *cx, *cy, *lw, *lh, n.x, n.y, n.w, n.h, LABEL_CLEAR
+                )),
+                "label on {edge} overlaps a node at ({cx:.1},{cy:.1})"
             );
+        }
+    }
+
+    #[test]
+    fn converging_label_chips_never_overlap() {
+        // Regression: G→C and W→C both aim at C — the second chip used
+        // to land on the first and paint over its text ("prob" clip).
+        let theme = theme();
+        let mut g = parse(SKIP_LEVEL_SRC);
+
+        rank(&mut g);
+        layout(&mut g, &theme);
+
+        let labels = placed_labels(&g, &theme);
+
+        for (i, ((ax, ay), (aw, ah), ea)) in labels.iter().enumerate() {
+            for ((bx, by), (bw, bh), eb) in labels.iter().skip(i + 1) {
+                assert!(
+                    !rects_touch(*ax, *ay, *aw, *ah, *bx, *by, *bw, *bh, 0.0),
+                    "label chips {ea} and {eb} overlap"
+                );
+            }
         }
     }
 
@@ -1037,7 +1164,7 @@ mod tests {
         let a = &g.nodes["B"];
         let b = &g.nodes["C"];
         let (lw, lh) = svg::label_size(&e.label, &theme);
-        let (cx, cy) = label_pos(&g, a, b, lw, lh);
+        let (cx, cy) = label_pos(&g, &[], a, b, lw, lh);
         let (x1, y1) = border(a, b.x, b.y);
         let (x2, y2) = border(b, a.x, a.y);
 
@@ -1065,13 +1192,100 @@ mod tests {
             .find(|e| e.from == "B" && e.to == "W")
             .expect("B -> W edge exists");
         let (lw, lh) = svg::label_size(&e.label, &theme);
-        let (cx, cy) = label_pos(&g, a, b, lw, lh);
+        let (cx, cy) = label_pos(&g, &[], a, b, lw, lh);
         let (x1, y1) = border(a, b.x, b.y);
         let (x2, y2) = border(b, a.x, a.y);
 
         assert!(
             (cx - (x1 + x2) / 2.0).abs() <= 0.5 && (cy - (y1 + y2) / 2.0).abs() <= 0.5,
             "B -> W label drifted off a clear midpoint"
+        );
+    }
+
+    #[test]
+    fn chip_overlap_uses_the_nodes_height_not_the_chips() {
+        // Regression: the "chip below node" clause compared against
+        // `n.y + h/2` (the CHIP's half-height) instead of `n.y + n.h/2`,
+        // so a chip overlapping the bottom half of a tall node passed
+        // as free — the label painted, then the node rect painted over
+        // it (info hidden). Node 40x80 at (100,100) spans y 60..140; a
+        // 30x10 chip at cy=145 overlaps (top edge 140 = node bottom).
+        let mut nodes = HashMap::new();
+
+        nodes.insert(
+            "N".to_string(),
+            Node {
+                id: "N".into(),
+                lines: vec!["N".into()],
+                shape: Shape::Rect,
+                group: String::new(),
+                x: 100.0,
+                y: 100.0,
+                w: 40.0,
+                h: 80.0,
+                rank: 0,
+            },
+        );
+        let g = Graph {
+            horizontal: false,
+            sign: 1.0,
+            ids: vec!["N".to_string()],
+            nodes,
+            edges: Vec::new(),
+            groups: Vec::new(),
+        };
+
+        assert!(
+            !chip_free(&g, &[], 100.0, 145.0, 30.0, 10.0),
+            "chip overlapping the tall node's lower half passed as free"
+        );
+        assert!(
+            chip_free(&g, &[], 100.0, 160.0, 30.0, 10.0),
+            "chip fully below the node (top 147 > bottom 140 + clear) must be free"
+        );
+    }
+
+    #[test]
+    fn rank_and_sibling_gaps_hold_their_floor() {
+        // The spacing contract: two ranks sit >= RANK_GAP apart and two
+        // siblings in a rank >= SIB_GAP — guards the readability floor.
+        let theme = theme();
+        let mut g = parse("flowchart LR\nA --> B\nA --> C\n");
+
+        rank(&mut g);
+        layout(&mut g, &theme);
+
+        let (a, b, c) = (&g.nodes["A"], &g.nodes["B"], &g.nodes["C"]);
+
+        assert!(
+            (b.x - b.w / 2.0) - (a.x + a.w / 2.0) >= RANK_GAP - 0.01,
+            "rank gap shrank below {RANK_GAP}px"
+        );
+        assert!(
+            (c.y - b.y).abs() - (b.h + c.h) / 2.0 >= SIB_GAP - 0.01,
+            "sibling gap shrank below {SIB_GAP}px"
+        );
+    }
+
+    #[test]
+    fn node_boxes_keep_their_label_inside() {
+        // Longer labels must grow the box, not overflow it: the width
+        // estimate is deliberately pessimistic, so a node's inner width
+        // (w - 2*PAD_X) must still cover the pessimistic text width.
+        let theme = theme();
+        let mut g = parse("flowchart LR\nA[\"a very long node label that must fit\"] --> B\n");
+
+        rank(&mut g);
+        layout(&mut g, &theme);
+
+        let n = &g.nodes["A"];
+        let longest = n.lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as f32;
+
+        assert!(
+            n.w - svg::PAD_X * 2.0 >= longest * theme.font_size * 0.6,
+            "label estimate overflows the node box (w={:.1}, label~{:.1})",
+            n.w,
+            longest * theme.font_size
         );
     }
 }

@@ -13,8 +13,11 @@
 
 use crate::model::{esc, Theme};
 
-/// Mean em-width of a sans glyph — see the module note.
-pub const CHAR_W: f32 = 0.62;
+/// Mean em-width of a sans glyph — see the module note. 0.68 errs wide
+/// on the docs corpus's label font (Inter-weight sans): under-measuring
+/// clips label text at the node border — a fixable-by-overestimation
+/// failure — while over-measuring only adds box padding.
+pub const CHAR_W: f32 = 0.68;
 
 /// Line height multiplier — 1.25em keeps `<br/>` lines readable.
 pub const LINE_H: f32 = 1.25;
