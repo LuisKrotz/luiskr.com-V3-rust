@@ -12,7 +12,7 @@
 //   [2]   time      seconds — drives wave/streak animation
 //   [3]   progress  0=off..1=on (eased by JS — shader just lerps)
 //   [4]   knob_x    knob center X in px (JS owns the spring)
-//   [5]   context   0=stats 1=grid 2=motion — picks track color+pattern
+//   [5]   context   0=stats 1=grid 2=motion 3=contrast — picks track color+pattern
 //   [6,7] pad       16B-alignment pad (vec4 boundary)
 //   [8..11] rect    widget clip rect, canvas DEVICE px
 //
@@ -26,7 +26,7 @@ struct Uniforms {
     time: f32,
     progress: f32,
     knob_x: f32,
-    context: f32, // 0=stats, 1=grid, 2=motion
+    context: f32, // 0=stats, 1=grid, 2=motion, 3=contrast
     pad0: f32,
     pad1: f32,
     rect: vec4<f32>,
@@ -80,8 +80,10 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         onTrack = vec3<f32>(0.08, 0.58, 0.36); // stats: emerald
     } else if (u.context < 1.5) {
         onTrack = vec3<f32>(0.06, 0.48, 0.72); // grid: cyan blueprint
-    } else {
+    } else if (u.context < 2.5) {
         onTrack = vec3<f32>(0.48, 0.24, 0.68); // motion: violet
+    } else {
+        onTrack = vec3<f32>(0.78, 0.50, 0.08); // contrast: amber
     }
 
     var col = mix(offTrack, onTrack, u.progress);
@@ -121,7 +123,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let gridPattern = clamp(isLineX + isLineY, 0.0, 1.0);
         let gridCol = mix(vec3<f32>(0.30, 0.35, 0.42), vec3<f32>(0.50, 0.85, 1.0), u.progress);
         col = col + gridCol * gridPattern * (0.25 + 0.55 * u.progress);
-    } else {
+    } else if (u.context < 2.5) {
         // MOTION — when OFF (reduced-motion): diagonal comet streaks
         // moving at 6px/s, fading over 12px of their 20px cycle.
         // When ON: a single calm datum line at track center — the
@@ -136,6 +138,21 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             let lineY = 1.0 - smoothstep(0.0, 1.2, abs(pixel.y - 14.0));
             col = col + vec3<f32>(0.95, 0.85, 1.0) * lineY * 0.60;
         }
+    } else {
+        // CONTRAST — sweeping luminance split ("comparison wipe"): a
+        // vertical seam travels the track on a slow sine (±17px around
+        // center); left of it near-black, right near-white — the
+        // before/after split of a contrast comparator. Alpha
+        // (0.30 + 0.60·progress): the split fades IN as the toggle turns
+        // on — a soft grey hint when off. The amber seam is the
+        // comparator's cursor riding the boundary.
+        let seamX = 27.0 + sin(u.time * 0.9) * 17.0;
+        let side = smoothstep(seamX - 0.9, seamX + 0.9, pixel.x);
+        let wipeCol = mix(vec3<f32>(0.05, 0.05, 0.08), vec3<f32>(0.98, 0.98, 1.0), side);
+        col = mix(col, wipeCol, 0.30 + 0.60 * u.progress);
+
+        let seam = 1.0 - smoothstep(0.0, 1.0, abs(pixel.x - seamX));
+        col = col + vec3<f32>(1.0, 0.78, 0.30) * seam * (0.30 + 0.50 * u.progress);
     }
 
     // Inset bezel — a darkening ramp in the outer 2.5px of the track
@@ -167,8 +184,10 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         dotCol = mix(vec3<f32>(0.6, 0.65, 0.7), vec3<f32>(0.1, 0.85, 0.45), u.progress);
     } else if (u.context < 1.5) {
         dotCol = mix(vec3<f32>(0.6, 0.65, 0.7), vec3<f32>(0.1, 0.65, 0.95), u.progress);
-    } else {
+    } else if (u.context < 2.5) {
         dotCol = mix(vec3<f32>(0.6, 0.65, 0.7), vec3<f32>(0.65, 0.4, 0.95), u.progress);
+    } else {
+        dotCol = mix(vec3<f32>(0.6, 0.65, 0.7), vec3<f32>(1.0, 0.75, 0.25), u.progress);
     }
 
     knobColor = mix(knobColor, dotCol, dotLight);
