@@ -1,0 +1,21 @@
+# nav-glyph — the hover motion for the nav chip glyphs (search prompt
+# streaks, preferences brush swoosh). Plain wasm-bindgen, no GPU: a fixed
+# particle pool advanced per frame and published as a flat Float32Array the
+# 2D canvas reads through wasm linear memory. Lazy-loaded by the nav icons.
+
+[package]
+name = "luiskr-nav-glyph"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+
+# Same wasm-opt flag contract as every widget crate.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "-all"]

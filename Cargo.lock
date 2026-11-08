@@ -199,6 +199,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "luiskr-nav-glyph"
+version = "0.1.0"
+dependencies = [
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "luiskr-ring-fill"
+version = "0.1.0"
+dependencies = [
+ "gpu-mini",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "luiskr-ring-sheen"
 version = "0.1.0"
 dependencies = [
