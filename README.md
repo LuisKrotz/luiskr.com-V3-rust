@@ -67,6 +67,11 @@ Artifacts land in `website/public/wasm/<slug>/` (served at
 `@vite-ignore`, so missing artifacts are clean no-ops — `yarn build`/
 `yarn verify` never require the Rust toolchain.
 
+After regenerating any widget artifact, run `yarn minify:wasm` from the
+repo root — the committed glue is shipped minified (terser, module
+mode; the `@ts-self-types` directive comment is preserved), so
+freshly emitted `pkg/*.js` must be re-minified before committing.
+
 ## Adding a widget
 
 1. `rust/<slug>/` — `Cargo.toml` (cdylib + `gpu-mini` path dep),
