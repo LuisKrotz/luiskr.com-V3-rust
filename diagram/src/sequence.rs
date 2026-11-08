@@ -76,25 +76,32 @@ struct Msg {
 /// direction). Anything else on the line is ignored — mermaid extras
 /// like `activate`/`deactivate`/`loop` fall through harmlessly.
 fn parse_msg(actors: &mut Vec<Actor>, line: &str) -> Option<Msg> {
-    // Find the arrow — longest spellings first.
+    // Find the arrow — longest spellings first so `-->>` isn't read
+    // as `->` + a stray dash.
     let (kind, _len) = ["-->>", "->>", "-->", "->", "<<--", "<<-", "-x", "--x"]
         .iter()
         .find_map(|op| line.find(op).map(|_p| (*op, op.len())))
         .unwrap_or(("", 0));
 
+    // No arrow anywhere → not a message line (e.g. `activate V`).
     if kind.is_empty() {
         return None;
     }
 
+    // Split at the arrow: left endpoint | right endpoint + text.
     let pos = line.find(kind).unwrap();
+
     let lhs = line[..pos].trim();
+
     let rest = &line[pos + kind.len()..];
+
     // RHS: participant id up to `:` then the message text.
     let (rhs, text) = match rest.split_once(':') {
         Some((r, t)) => (r.trim(), t.trim()),
         None => (rest.trim(), ""),
     };
 
+    // Either side empty → malformed, not a message.
     if lhs.is_empty() || rhs.is_empty() {
         return None;
     }
@@ -105,6 +112,9 @@ fn parse_msg(actors: &mut Vec<Actor>, line: &str) -> Option<Msg> {
     } else {
         (lhs, rhs)
     };
+
+    // Participant lookup-or-declare — an undeclared endpoint creates
+    // its column right here (declaration order = column order).
     let find_or_push = |actors: &mut Vec<Actor>, name: &str| -> usize {
         if let Some(i) = actors.iter().position(|a| a.id == name) {
             i
@@ -115,13 +125,19 @@ fn parse_msg(actors: &mut Vec<Actor>, line: &str) -> Option<Msg> {
                 x: 0.0,
                 w: 0.0,
             });
+
             actors.len() - 1
         }
     };
 
     let from = find_or_push(actors, from_name);
+
     let to = find_or_push(actors, to_name);
+
     let label = label_lines(text);
+
+    // Empty message text keeps a one-slot label so the row height
+    // math stays uniform.
     let label = if label.is_empty() {
         vec![String::new()]
     } else {
@@ -139,13 +155,19 @@ fn parse_msg(actors: &mut Vec<Actor>, line: &str) -> Option<Msg> {
 
 /// Parses + lays out + emits a sequence diagram.
 pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
+    // Three IR collections — columns, rows, and band notes — filled
+    // in one parse pass; notes store (column-center, row, lines).
     let mut actors: Vec<Actor> = Vec::new();
+
     let mut msgs: Vec<Msg> = Vec::new();
+
     let mut notes: Vec<(f32, f32, Vec<String>)> = Vec::new(); // (x_center, y, lines)
 
+    // Skip line 0 (the `sequenceDiagram` keyword itself).
     for raw in source.lines().skip(1) {
         let line = raw.trim();
 
+        // Blank lines + `%%` mermaid comments.
         if line.is_empty() || line.starts_with("%%") {
             continue;
         }
@@ -159,6 +181,8 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
                 None => (spec.to_string(), vec![spec.to_string()]),
             };
 
+            // Declare the actor — an empty `as` label falls back to
+            // the raw spec so the box is never blank.
             actors.push(Actor {
                 id,
                 lines: if label.is_empty() {
@@ -169,17 +193,23 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
                 x: 0.0,
                 w: 0.0,
             });
+
             continue;
         }
 
         if let Some(rest) = line.strip_prefix("Note over") {
             // `Note over A,B: text` — a band across those lifelines.
             if let Some((who, text)) = rest.split_once(':') {
+                // Resolve the named participants to column indices —
+                // unknown names drop out of the list.
                 let cols: Vec<usize> = who
                     .split(',')
                     .filter_map(|n| actors.iter().position(|a| a.id == n.trim()))
                     .collect();
 
+                // Only record a note that names at least one real
+                // participant; the band centers on the mean column
+                // and attaches at the current message row.
                 if !cols.is_empty() {
                     notes.push((
                         cols.iter().map(|&c| c as f32).sum::<f32>() / cols.len() as f32,
@@ -207,11 +237,15 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
             continue;
         }
 
+        // Whatever survived is a message candidate — parse_msg
+        // rejects lines with no arrow.
         if let Some(m) = parse_msg(&mut actors, line) {
             msgs.push(m);
         }
     }
 
+    // Nothing drawable — either side missing means the parse found
+    // no real diagram; report so the caller shows the source.
     if actors.is_empty() || msgs.is_empty() {
         return Err("no participants/messages parsed".into());
     }
@@ -222,20 +256,30 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
     // would stretch the diagram for one long label.
     let mut widest: f32 = 0.0;
 
+    // Measure every actor label — box width gets an 80 px floor so
+    // one-letter ids still render a readable lifeline head.
     for a in actors.iter_mut() {
         let (w, _) = svg::label_size(&a.lines, theme);
 
         a.w = w.max(80.0);
+
         widest = widest.max(a.w);
     }
+
+    // …and every message label — a long message between adjacent
+    // lifelines is the pitch driver.
     for m in &msgs {
         let (w, _) = svg::label_size(&m.label, theme);
 
         widest = widest.max(w);
     }
 
+    // Uniform pitch: the base gap, widened when the widest text needs
+    // it (+60 px slack between the label's end and the next box).
     let pitch = COL_GAP.max(widest + 60.0);
 
+    // Place column centers on the pitch grid — i+0.5 lands the first
+    // lifeline half a pitch inside the margin.
     for (i, a) in actors.iter_mut().enumerate() {
         a.x = MARGIN + pitch * (i as f32 + 0.5);
     }
@@ -243,15 +287,24 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
     // ── Row layout ──────────────────────────────────────────────────
     // Head row at top; each message takes ROW_H, self-messages add
     // SELF_H so the loop stub has room.
+    // Actor boxes sit centered at head_y; the first message row
+    // starts a bit below the boxes (0.6·ROW_H of breathing room).
     let head_y = MARGIN + ACTOR_H / 2.0;
+
     let mut y = MARGIN + ACTOR_H + ROW_H * 0.6;
 
+    // Assign each message a row center; self-messages consume extra
+    // vertical room for their loop stub.
     for m in msgs.iter_mut() {
         m.y = y;
+
         y += ROW_H + if m.from == m.to { SELF_H } else { 0.0 };
     }
 
+    // Diagram bottom = last row + margin; base width = the column
+    // grid, widened below by overshooting labels.
     let bottom = y + MARGIN;
+
     let mut total_w = MARGIN * 2.0 + pitch * actors.len() as f32;
 
     // Painted horizontal bounds — a self-message label hangs off the
@@ -260,27 +313,39 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
     // column grid on either side. Folding them into the width keeps the
     // viewBox from clipping them.
     let mut min_x = 0.0f32;
+
+    // Self-loop stub length — capped so a wide pitch doesn't stretch
+    // loops absurdly.
     let stub = COL_GAP.min(80.0) * 0.5;
 
+    // Fold each self-message's right-hanging label into the bounds.
     for m in &msgs {
         if m.from != m.to {
             continue;
         }
 
         let (lw, _) = svg::label_size(&m.label, theme);
+
         let cx = actors[m.from].x + stub / 2.0 + 8.0;
 
         min_x = min_x.min(cx - lw / 2.0);
+
         total_w = total_w.max(cx + lw / 2.0 + MARGIN);
     }
+
+    // …and each note band, centered on its mean lifeline.
     for (cx_col, _row, lines) in &notes {
         let (nw, _) = svg::label_size(lines, theme);
+
         let cx = MARGIN + pitch * (cx_col + 0.5);
 
         min_x = min_x.min(cx - nw / 2.0 - MARGIN);
+
         total_w = total_w.max(cx + nw / 2.0 + MARGIN);
     }
 
+    // viewBox origin — min(0, min_x) keeps the left edge at 0 unless
+    // an overshoot pushed bounds negative.
     let origin_x = min_x.min(0.0);
 
     // ── Emit ────────────────────────────────────────────────────────
@@ -325,8 +390,12 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
             // horizontal line out, drop SELF_H, back into the lifeline.
             let stub = COL_GAP.min(80.0) * 0.5;
 
+            // Return leg — same length, back to the lifeline.
             let back = -stub;
+
             let line_c = esc(&theme.line);
+
+            // Dashed self-messages keep the 5,4 pattern.
             let dash = if m.dashed { "5,4" } else { "0" };
 
             out.push_str(&format!(
@@ -345,7 +414,11 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
             continue;
         }
 
+        // Cross-lifeline arrow — the label centers between columns,
+        // the line stops ARROW px short of the target so the head
+        // lands on the lifeline.
         let (x1, x2) = (a.x, b.x);
+
         let dir = (x2 - x1).signum();
         // Label above the line, centered between the lifelines.
         svg::centered_text(
@@ -370,6 +443,7 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
 
     // Actor boxes last — they cap the lifelines visually.
     for a in &actors {
+        // Box top-left = center − half width; height fixed ACTOR_H.
         let x = a.x - a.w / 2.0;
 
         out.push_str(&format!(
@@ -378,6 +452,8 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
             esc(&theme.bg),
             esc(&theme.accent),
         ));
+
+        // Label centered in the box.
         svg::centered_text(&mut out, a.x, head_y, &a.lines, theme);
     }
 

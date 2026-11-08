@@ -14,77 +14,73 @@
 //              transparent across its 25% width — the SCSS band
 //              gradient is `90deg, transparent, accent 50%, transparent`).
 //
+// Fragment-side chunk only — ease_smooth_step + vs_main come from
+// gpu-mini's wgsl library.
+//
 // Uniform layout (f32s=16 — lib.rs doc):
-//   [0,1] res · [2] time · [3] pad · [4..8) border rgba ·
-//   [8..12) accent rgba · [12..16) rect (0,0,w,h device px)
+//   [0,1] resolution_dev · [2] time_seconds · [3] reserved ·
+//   [4..8) border_rgba · [8..12) accent_rgba ·
+//   [12..16) clip_rect (0,0,w,h device px)
 
-struct U {
-    res     : vec2<f32>,
-    time    : f32,
-    _pad0   : f32,
-    border  : vec4<f32>,
-    accent  : vec4<f32>,
-    rect    : vec4<f32>,
+struct Uniforms {
+    resolution_dev: vec2<f32>,
+    time_seconds: f32,
+    reserved: f32,
+    border_rgba: vec4<f32>,
+    accent_rgba: vec4<f32>,
+    clip_rect: vec4<f32>,
 };
 
-@group(0) @binding(0) var<uniform> u : U;
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
-/// `ease` — smoothstep ease-in-out matching the CSS `ease-in-out`
-/// timing function closely enough for a 7s ambient sweep (the
-/// difference vs the CSS cubic-bezier(0.42,0,0.58,1) is sub-frame at
-/// this period — smoothstep is the standard stand-in).
-fn ease(t : f32) -> f32 {
-    return t * t * (3.0 - 2.0 * t);
-}
+// ── Tunables ─────────────────────────────────────────────────────────
+
+// Hairline edge fade — ramps in 0..FADE_IN_HI, full to FADE_OUT_LO,
+// out to 1 (the SCSS 12%/88% stops).
+const FADE_IN_HI: f32 = 0.12;
+const FADE_OUT_LO: f32 = 0.88;
+
+// Traveling band — the CSS: width 25%, translateX(-110% → 440%) over
+// 7s ease-in-out. In uv terms the band's LEFT edge travels
+// TRAVEL_LO → TRAVEL_HI; the center is left + half the band width.
+const SWEEP_PERIOD_S: f32 = 7.0;
+const TRAVEL_LO: f32 = -0.275;
+const TRAVEL_HI: f32 = 1.1;
+const BAND_HALF_WIDTH: f32 = 0.125;
 
 /// `fs_main` — one fragment of the divider quad.
 @fragment
-fn fs_main(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {
+fn fs_main(@builtin(position) pixel_coord: vec4<f32>) -> @location(0) vec4<f32> {
     // frag→uv in the widget rect — device px to 0..1.
-    let uv = (frag.xy - u.rect.xy) / u.rect.zw;
+    let widget_uv = (pixel_coord.xy - uniforms.clip_rect.xy) / uniforms.clip_rect.zw;
 
     // ── Hairline base ──────────────────────────────────────────────
     // Edge fade: linear-gradient(90deg, transparent, border 12%,
-    // border 88%, transparent) — ramps in 0..0.12, full 0.12..0.88,
-    // out 0.88..1.
-    let fade_in = smoothstep(0.0, 0.12, uv.x);
-    let fade_out = 1.0 - smoothstep(0.88, 1.0, uv.x);
-    let edge = fade_in * fade_out;
+    // border 88%, transparent).
+    let fade_in = smoothstep(0.0, FADE_IN_HI, widget_uv.x);
+    let fade_out = 1.0 - smoothstep(FADE_OUT_LO, 1.0, widget_uv.x);
+    let edge_fade = fade_in * fade_out;
 
-    var col = vec4<f32>(u.border.rgb, u.border.a * edge);
+    var color = vec4<f32>(uniforms.border_rgba.rgb, uniforms.border_rgba.a * edge_fade);
 
     // ── Traveling accent band ──────────────────────────────────────
-    // The CSS: band width 25%, translateX(-110% → 440%) over 7s
-    // ease-in-out. In uv terms the band's LEFT edge travels
-    // -0.275 → 1.1 (band-width fractions of the hairline width).
-    // Center = left + 0.125.
-    let phase = fract(u.time / 7.0);
-    let left = mix(-0.275, 1.1, ease(phase));
-    let cx = left + 0.125;
+    // smoothstep ≈ the CSS ease-in-out timing (the difference vs
+    // cubic-bezier(0.42,0,0.58,1) is sub-frame at this period).
+    let phase = fract(uniforms.time_seconds / SWEEP_PERIOD_S);
+    let band_left = mix(TRAVEL_LO, TRAVEL_HI, ease_smooth_step(phase));
+    let band_center = band_left + BAND_HALF_WIDTH;
 
     // Band gradient: transparent → accent @50% → transparent across
     // the 25% width — triangular falloff (the CSS linear-gradient
     // is linear, so a triangle, not a bell).
-    let d = abs(uv.x - cx) / 0.125;
-    let band = (1.0 - d) * step(d, 1.0);
+    let band_dist = abs(widget_uv.x - band_center) / BAND_HALF_WIDTH;
+    let band = (1.0 - band_dist) * step(band_dist, 1.0);
 
-    col = vec4<f32>(
-        mix(col.rgb, u.accent.rgb, band * u.accent.a),
-        max(col.a, band * u.accent.a),
+    color = vec4<f32>(
+        mix(color.rgb, uniforms.accent_rgba.rgb, band * uniforms.accent_rgba.a),
+        max(color.a, band * uniforms.accent_rgba.a),
     );
 
     // Premultiplied out — the canvas alpha mode is premultiplied.
-    return vec4<f32>(col.rgb * col.a, col.a);
-}
-
-/// `vs_main` — the shared fullscreen triangle (gpu-mini contract).
-@vertex
-fn vs_main(@builtin(vertex_index) i : u32) -> @builtin(position) vec4<f32> {
-    var pos = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>(3.0, -1.0),
-        vec2<f32>(-1.0, 3.0),
-    );
-
-    return vec4<f32>(pos[i], 0.0, 1.0);
+    return vec4<f32>(color.rgb * color.a, color.a);
 }

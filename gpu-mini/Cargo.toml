@@ -107,3 +107,8 @@ features = [
   "GpuCopyExternalImageDestInfo",
   "ImageBitmap",
 ]
+
+# naga is a DEV-ONLY dependency — it parses/validates WGSL on the host
+# in tests/wgsl_gate.rs and never links into any wasm artifact.
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in"] }

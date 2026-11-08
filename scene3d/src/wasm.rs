@@ -80,8 +80,15 @@ pub fn mount(
     w: u32,
     h: u32,
 ) -> Result<Surface3d, JsValue> {
+    // Bind the canvas to the shared device — context + format
+    // negotiation happens inside gpu-mini; a failure propagates as
+    // Err so JS keeps its WebGL/CSS fallback.
     let surface = gpu_mini::init_surface(&canvas, &device)?;
 
+    // Build the engine state: 45° fov / 0.1–4000 clip matches the
+    // three.js PerspectiveCamera defaults the scenes were authored
+    // against; light/clear/post start at the no-op defaults the JS
+    // layer overwrites via set_* calls.
     Ok(Surface3d {
         scene: Scene::new(),
         cam: Camera::new(45.0, 0.1, 4000.0),
@@ -566,13 +573,17 @@ impl Surface3d {
     /// @param i Instance slot.
     /// @param m The 16-f32 matrix.
     pub fn set_instance(&mut self, node: u32, i: u32, m: &[f32]) {
+        // Malformed typed array (JS bug) → drop the write; a partial
+        // matrix would corrupt one instance's transform.
         if m.len() < 16 {
             return;
         }
 
+        // Copy into a fixed-size array — Mat4 stores [f32; 16].
         let mut arr = [0.0f32; 16];
 
         arr.copy_from_slice(&m[0..16]);
+
         self.scene.set_instance(NodeId(node), i, Mat4 { m: arr });
     }
 
@@ -711,10 +722,19 @@ impl Surface3d {
     /// @param sw @param sh Canvas size in CSS px.
     /// @returns [ox, oy, oz, dx, dy, dz] — origin + normalized dir.
     pub fn ray_at(&mut self, sx: f32, sy: f32, sw: f32, sh: f32) -> Vec<f32> {
+        // CSS px → NDC: x maps [0,w]→[−1,1]; y maps [0,h]→[1,−1]
+        // (DOM y runs downward, NDC y upward — the flip lives here).
+        // max(1.0) guards a degenerate zero-size canvas.
         let ndc_x = (sx / sw.max(1.0)) * 2.0 - 1.0;
+
         let ndc_y = 1.0 - (sy / sh.max(1.0)) * 2.0;
+
         let aspect = sw / sh.max(1.0);
+
+        // view() composes orbit or direct TRS into the camera's view
+        // matrix; its rotational inverse is the camera's world basis.
         let view = self.cam.view();
+
         let mut inv_view = crate::camera::view_rot_to_world(&view);
 
         // Append the translation column — rot⁻¹ · t⁻¹ = world mat.
@@ -722,6 +742,9 @@ impl Surface3d {
         inv_view.m[13] = self.cam.position.y;
         inv_view.m[14] = self.cam.position.z;
 
+        // Unproject: half-fov tangent + aspect scale the NDC point
+        // into a camera-space direction, which the world basis then
+        // rotates out — see math.rs ray_from_screen.
         let ray = crate::math::ray_from_screen(
             ndc_x,
             ndc_y,
@@ -731,6 +754,8 @@ impl Surface3d {
             self.cam.position,
         );
 
+        // Flat f32 list out — the JS caller destructures origin/dir
+        // and loops bodies for sphere tests.
         vec![
             ray.origin.x,
             ray.origin.y,

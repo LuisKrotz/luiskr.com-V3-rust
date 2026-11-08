@@ -254,61 +254,62 @@ pub fn ring(inner_radius: f32, outer_radius: f32, segments: u32) -> Geometry {
 /// normals into a blob-shaded mess. This is THE reason three.js
 /// BoxGeometry carries 24 vertices for 8 corners.
 ///
-/// `w`,`h`,`d` are full extents, centred on origin.
+/// `width`,`height`,`depth` are full extents, centred on origin.
 ///
-/// @param w Full x extent. @param h Full y extent. @param d Full z extent.
+/// @param width Full x extent. @param height Full y extent.
+/// @param depth Full z extent.
 /// @returns Indexed box mesh.
-pub fn box_mesh(w: f32, h: f32, d: f32) -> Geometry {
-    let mut g = Geometry::default();
-    let (hw, hh, hd) = (w * 0.5, h * 0.5, d * 0.5);
+pub fn box_mesh(width: f32, height: f32, depth: f32) -> Geometry {
+    let mut geo = Geometry::default();
+    let (half_width, half_height, half_depth) = (width * 0.5, height * 0.5, depth * 0.5);
 
     // (normal axis, half-extent sign, tangent axes (u,v)) — six faces.
     // For each face the four corners are swept in face-local uv space;
     // winding is fixed CCW seen from OUTSIDE by ordering tl→tr→bl→br
     // along the face's local axes and emitting (0,1,2)+(1,3,2).
     let faces: [(Vec3, [f32; 3], [f32; 3]); 6] = [
-        // n, u-axis extents, v-axis extents — face centre = n·half.
-        (Vec3::new(0.0, 0.0, 1.0), [hw, 0.0, 0.0], [0.0, hh, 0.0]), // +Z
-        (Vec3::new(0.0, 0.0, -1.0), [-hw, 0.0, 0.0], [0.0, hh, 0.0]), // -Z
-        (Vec3::new(0.0, 1.0, 0.0), [hw, 0.0, 0.0], [0.0, 0.0, -hd]), // +Y
-        (Vec3::new(0.0, -1.0, 0.0), [hw, 0.0, 0.0], [0.0, 0.0, hd]), // -Y
-        (Vec3::new(1.0, 0.0, 0.0), [0.0, 0.0, -hd], [0.0, hh, 0.0]), // +X
-        (Vec3::new(-1.0, 0.0, 0.0), [0.0, 0.0, hd], [0.0, hh, 0.0]), // -X
+        // normal, u-axis extents, v-axis extents — face centre = n·half.
+        (Vec3::new(0.0, 0.0, 1.0), [half_width, 0.0, 0.0], [0.0, half_height, 0.0]), // +Z
+        (Vec3::new(0.0, 0.0, -1.0), [-half_width, 0.0, 0.0], [0.0, half_height, 0.0]), // -Z
+        (Vec3::new(0.0, 1.0, 0.0), [half_width, 0.0, 0.0], [0.0, 0.0, -half_depth]), // +Y
+        (Vec3::new(0.0, -1.0, 0.0), [half_width, 0.0, 0.0], [0.0, 0.0, half_depth]), // -Y
+        (Vec3::new(1.0, 0.0, 0.0), [0.0, 0.0, -half_depth], [0.0, half_height, 0.0]), // +X
+        (Vec3::new(-1.0, 0.0, 0.0), [0.0, 0.0, half_depth], [0.0, half_height, 0.0]), // -X
     ];
 
-    for (n, ua, va) in faces {
-        let base = g.vertex_count() as u32;
+    for (normal, u_axis, v_axis) in faces {
+        let base = geo.vertex_count() as u32;
 
         // Face centre sits one half-extent along the normal.
-        let half = Vec3::new(
-            n.x * (if n.x != 0.0 { hw } else { 0.0 })
-                + n.y * (if n.y != 0.0 { hh } else { 0.0 })
-                + n.z * (if n.z != 0.0 { hd } else { 0.0 }),
-            n.y * (if n.y != 0.0 { hh } else { 0.0 })
-                + n.x * (if n.x != 0.0 { hw } else { 0.0 })
-                + n.z * (if n.z != 0.0 { hd } else { 0.0 }),
-            n.z * (if n.z != 0.0 { hd } else { 0.0 })
-                + n.x * (if n.x != 0.0 { hw } else { 0.0 })
-                + n.y * (if n.y != 0.0 { hh } else { 0.0 }),
+        let face_center = Vec3::new(
+            normal.x * (if normal.x != 0.0 { half_width } else { 0.0 })
+                + normal.y * (if normal.y != 0.0 { half_height } else { 0.0 })
+                + normal.z * (if normal.z != 0.0 { half_depth } else { 0.0 }),
+            normal.y * (if normal.y != 0.0 { half_height } else { 0.0 })
+                + normal.x * (if normal.x != 0.0 { half_width } else { 0.0 })
+                + normal.z * (if normal.z != 0.0 { half_depth } else { 0.0 }),
+            normal.z * (if normal.z != 0.0 { half_depth } else { 0.0 })
+                + normal.x * (if normal.x != 0.0 { half_width } else { 0.0 })
+                + normal.y * (if normal.y != 0.0 { half_height } else { 0.0 }),
         );
 
         // Corners at centre ± u-axis ± v-axis, in uv order (0,0),(1,0),(0,1),(1,1).
-        for (su, sv) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-            let p = Vec3::new(
-                half.x + ua[0] * su + va[0] * sv,
-                half.y + ua[1] * su + va[1] * sv,
-                half.z + ua[2] * su + va[2] * sv,
+        for (sign_u, sign_v) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+            let corner = Vec3::new(
+                face_center.x + u_axis[0] * sign_u + v_axis[0] * sign_v,
+                face_center.y + u_axis[1] * sign_u + v_axis[1] * sign_v,
+                face_center.z + u_axis[2] * sign_u + v_axis[2] * sign_v,
             );
-            let uv = [(su + 1.0) * 0.5, (sv + 1.0) * 0.5];
+            let tex_uv = [(sign_u + 1.0) * 0.5, (sign_v + 1.0) * 0.5];
 
-            g.push_vertex(p, n, uv);
+            geo.push_vertex(corner, normal, tex_uv);
         }
 
-        g.indices
+        geo.indices
             .extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
     }
 
-    g
+    geo
 }
 
 // ── Cylinder ────────────────────────────────────────────────────────

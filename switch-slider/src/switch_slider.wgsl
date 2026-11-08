@@ -3,18 +3,22 @@
 // WGSL port of core/utils/canvas/widgets/switch-slider/shaders.ts.
 // Unlike the other widgets this shader works in RAW PIXELS, not UV —
 // the original canvas was a fixed 28px-tall strip and every number is
-// pixel-perfect for it. u.res carries that design size; at other sizes
-// the pixel values do NOT scale (a deliberate choice — the toggle is a
-// fixed-size control, not a responsive surface).
+// pixel-perfect for it. `resolution_css` carries that design size; at
+// other sizes the pixel values do NOT scale (a deliberate choice — the
+// toggle is a fixed-size control, not a responsive surface).
+//
+// Fragment-side chunk only — dist_to_segment + vs_main come from
+// gpu-mini's wgsl library.
 //
 // Uniform layout (f32s, switch_slider.rs::UNIFORM_F32S = 12):
-//   [0,1] res       design size, px (track is 14px tall, radius 14)
-//   [2]   time      seconds — drives wave/streak animation
-//   [3]   progress  0=off..1=on (eased by JS — shader just lerps)
-//   [4]   knob_x    knob center X in px (JS owns the spring)
-//   [5]   context   0=stats 1=grid 2=motion 3=contrast — picks track color+pattern
-//   [6,7] pad       16B-alignment pad (vec4 boundary)
-//   [8..11] rect    widget clip rect, canvas DEVICE px
+//   [0,1] resolution_css design size, px (track is 14px tall, radius 14)
+//   [2]   time_seconds   seconds — drives wave/streak animation
+//   [3]   switch_progress 0=off..1=on (eased by JS — shader just lerps)
+//   [4]   knob_center_x  knob center X in px (JS owns the spring)
+//   [5]   context_id     0=stats 1=grid 2=motion 3=contrast — picks
+//                        track color+pattern
+//   [6,7] reserved       16B-alignment pad (vec4 boundary)
+//   [8..11] clip_rect    widget clip rect, canvas DEVICE px
 //
 // Render order inside this shader (each layer darkens/brightens the
 // previous — order matters, don't reorder):
@@ -22,178 +26,264 @@
 //   knob sphere → accent dot → outer AA mask.
 
 struct Uniforms {
-    res: vec2<f32>,
-    time: f32,
-    progress: f32,
-    knob_x: f32,
-    context: f32, // 0=stats, 1=grid, 2=motion, 3=contrast
-    pad0: f32,
-    pad1: f32,
-    rect: vec4<f32>,
+    resolution_css: vec2<f32>,
+    time_seconds: f32,
+    switch_progress: f32,
+    knob_center_x: f32,
+    context_id: f32, // 0=stats, 1=grid, 2=motion, 3=contrast
+    reserved0: f32,
+    reserved1: f32,
+    clip_rect: vec4<f32>,
 }
 
-@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
-fn distCapsule(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
-    let pa = p - a;
-    let ba = b - a;
-    let h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
-    return length(pa - ba * h);
-}
+// ── Tunables ─────────────────────────────────────────────────────────
 
-@vertex
-fn vs_main(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
-    var pos = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0),
-    );
-    return vec4<f32>(pos[vid], 0.0, 1.0);
-}
+// Track geometry — the pill is a 14px-radius capsule spanning
+// (14,14)→(res.x−14,14); the toggle was authored at that exact size.
+const TRACK_Y_PX: f32 = 14.0;
+const TRACK_RADIUS: f32 = 14.0;
+const TRACK_END_INSET: f32 = 14.0;
+const BORDER_AA_LO: f32 = 13.2;
+const BORDER_AA_HI: f32 = 14.0;
+// Inset bezel — a darkening ramp in the outer 2.5px of the track that
+// makes the pill read as inset glass.
+const BEZEL_LO: f32 = 11.5;
+const BEZEL_HI: f32 = 14.0;
+const BEZEL_STRENGTH: f32 = 0.35;
+const BEZEL_INK = vec3<f32>(0.0);
+
+// Track inks — the off state plus one "on" accent per context. These
+// are the same semantic accents the DOM toggles use; each context's
+// pattern below tints in the same family.
+const TRACK_OFF = vec3<f32>(0.18, 0.19, 0.22);
+const TRACK_STATS = vec3<f32>(0.08, 0.58, 0.36);   // emerald
+const TRACK_GRID = vec3<f32>(0.06, 0.48, 0.72);    // cyan blueprint
+const TRACK_MOTION = vec3<f32>(0.48, 0.24, 0.68);  // violet
+const TRACK_CONTRAST = vec3<f32>(0.78, 0.50, 0.08);// amber
+
+// Context pattern inks.
+const WAVE_DIM = vec3<f32>(0.35, 0.40, 0.45);   // ECG trace when off
+const WAVE_LIT = vec3<f32>(0.45, 1.0, 0.65);    // ECG trace when on
+const GRID_DIM = vec3<f32>(0.30, 0.35, 0.42);   // blueprint when off
+const GRID_LIT = vec3<f32>(0.50, 0.85, 1.0);    // blueprint when on
+const STREAK_INK = vec3<f32>(0.85, 0.70, 1.0);  // comet streaks (off)
+const DATUM_INK = vec3<f32>(0.95, 0.85, 1.0);   // calm datum (on)
+const WIPE_DARK = vec3<f32>(0.05, 0.05, 0.08);  // comparator dark side
+const WIPE_LIGHT = vec3<f32>(0.98, 0.98, 1.0);  // comparator light side
+const SEAM_INK = vec3<f32>(1.0, 0.78, 0.30);    // comparator cursor
+
+// Stats pattern — an ECG/heartbeat trace scrolling 20px/s; base sine
+// ±2.5px plus a 36px-period QRS spike window.
+const ECG_SCROLL_PX_S: f32 = 20.0;
+const ECG_FREQ: f32 = 0.35;
+const ECG_SWELL: f32 = 2.5;
+const ECG_PERIOD: f32 = 36.0;
+const ECG_SPIKE_LO: f32 = 12.0;
+const ECG_SPIKE_HI: f32 = 18.0;
+const ECG_SPIKE_CENTER: f32 = 15.0;
+const ECG_SPIKE_SLOPE: f32 = -2.8;
+const ECG_OFF_DAMP: f32 = 0.3;
+const ECG_ON_GAIN: f32 = 0.7;
+const ECG_GLOW_WIDTH: f32 = 1.6;
+const ECG_STRENGTH: f32 = 0.85;
+
+// Grid pattern — blueprint hatch: verticals every 8px drifting 3px/s
+// + fixed horizontals every 7px; fades in as the switch turns on.
+const GRID_X_PERIOD: f32 = 8.0;
+const GRID_X_CENTER: f32 = 4.0;
+const GRID_X_SCROLL: f32 = 3.0;
+const GRID_Y_PERIOD: f32 = 7.0;
+const GRID_Y_CENTER: f32 = 3.5;
+const GRID_LINE_SOFT: f32 = 1.0;
+const GRID_OFF_ALPHA: f32 = 0.25;
+const GRID_ON_GAIN: f32 = 0.55;
+
+// Motion pattern — off: diagonal comet streaks at 6px/s fading over
+// 12px of their 20px cycle; on: a single calm datum line at center.
+const STREAK_PERIOD: f32 = 20.0;
+const STREAK_Y_PERIOD: f32 = 7.0;
+const STREAK_Y_CENTER: f32 = 3.5;
+const STREAK_SCROLL: f32 = 6.0;
+const STREAK_FADE: f32 = 12.0;
+const STREAK_SOFT: f32 = 1.2;
+const STREAK_ALPHA: f32 = 0.45;
+const DATUM_SOFT: f32 = 1.2;
+const DATUM_ALPHA: f32 = 0.60;
+
+// Contrast pattern — a sweeping luminance split: a vertical seam
+// travels ±17px around the 27px mark on a slow sine.
+const SEAM_CENTER: f32 = 27.0;
+const SEAM_TRAVEL: f32 = 17.0;
+const SEAM_SPEED: f32 = 0.9;
+const SEAM_SOFT: f32 = 0.9;
+const SEAM_CURSOR_SOFT: f32 = 1.0;
+const WIPE_OFF_ALPHA: f32 = 0.30;
+const WIPE_ON_GAIN: f32 = 0.60;
+const SEAM_OFF_ALPHA: f32 = 0.30;
+const SEAM_ON_GAIN: f32 = 0.50;
+
+// The knob — a fake-3D sphere from one distance field: a soft shadow
+// ring past the edge, ~15% rim darkening (cheap Lambert-ish shading —
+// no normals needed at this size), and a 2.7px accent dot at center.
+const KNOB_RADIUS: f32 = 11.0;
+const KNOB_SHADOW_WIDTH: f32 = 2.5;
+const KNOB_SHADOW_STRENGTH: f32 = 0.35;
+const KNOB_SHADOW_INK = vec3<f32>(0.0);
+const KNOB_RIM_DARKEN: f32 = 0.15;
+const KNOB_SKIN = vec3<f32>(0.98, 0.98, 1.0);
+const KNOB_AA_LO: f32 = -0.6;
+const KNOB_AA_HI: f32 = 0.4;
+const DOT_RADIUS_LO: f32 = 2.0;
+const DOT_RADIUS_HI: f32 = 2.7;
+const DOT_OFF = vec3<f32>(0.6, 0.65, 0.7);
+const DOT_STATS = vec3<f32>(0.1, 0.85, 0.45);
+const DOT_GRID = vec3<f32>(0.1, 0.65, 0.95);
+const DOT_MOTION = vec3<f32>(0.65, 0.4, 0.95);
+const DOT_CONTRAST = vec3<f32>(1.0, 0.75, 0.25);
+
+// Context thresholds — context_id is an f32 (uniform blocks carry no
+// ints); the midpoint steps bucket it back to its enum.
+const CTX_STATS_MAX: f32 = 0.5;
+const CTX_GRID_MAX: f32 = 1.5;
+const CTX_MOTION_MAX: f32 = 2.5;
 
 @fragment
-fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+fn fs_main(@builtin(position) pixel_coord: vec4<f32>) -> @location(0) vec4<f32> {
     // The original ran in a dedicated 28px-tall canvas; normalize into
-    // the widget rect and continue in its own px space. WGSL `frag`
-    // is framebuffer-origin (y=0 at TOP) while the ported GLSL math
-    // assumes gl_FragCoord/v_uv semantics (y=0 at BOTTOM) — uv.y is
-    // flipped here so every constant below measures from the bottom
-    // edge exactly like the original shader did.
-    let uv = vec2<f32>(
-        (frag.x - u.rect.x) / u.rect.z,
-        1.0 - (frag.y - u.rect.y) / u.rect.w,
+    // the widget rect and continue in its own px space. WGSL
+    // `pixel_coord` is framebuffer-origin (y=0 at TOP) while the ported
+    // GLSL math assumes gl_FragCoord/v_uv semantics (y=0 at BOTTOM) —
+    // widget_uv.y is flipped here so every constant below measures
+    // from the bottom edge exactly like the original shader did.
+    let widget_uv = vec2<f32>(
+        (pixel_coord.x - uniforms.clip_rect.x) / uniforms.clip_rect.z,
+        1.0 - (pixel_coord.y - uniforms.clip_rect.y) / uniforms.clip_rect.w,
     );
-    let pixel = uv * u.res;
+    let pixel = widget_uv * uniforms.resolution_css;
 
-    let centerA = vec2<f32>(14.0, 14.0);
-    let centerB = vec2<f32>(u.res.x - 14.0, 14.0);
-    let trackDist = distCapsule(pixel, centerA, centerB);
+    let track_start = vec2<f32>(TRACK_END_INSET, TRACK_Y_PX);
+    let track_end = vec2<f32>(uniforms.resolution_css.x - TRACK_END_INSET, TRACK_Y_PX);
+    let track_dist = dist_to_segment(pixel, track_start, track_end);
 
-    if (trackDist > 14.0) {
+    if (track_dist > TRACK_RADIUS) {
         discard;
     }
 
-    let borderAA = 1.0 - smoothstep(13.2, 14.0, trackDist);
+    let border_alpha = 1.0 - smoothstep(BORDER_AA_LO, BORDER_AA_HI, track_dist);
 
-    let offTrack = vec3<f32>(0.18, 0.19, 0.22);
-    var onTrack: vec3<f32>;
+    var track_ink = TRACK_OFF;
 
-    if (u.context < 0.5) {
-        onTrack = vec3<f32>(0.08, 0.58, 0.36); // stats: emerald
-    } else if (u.context < 1.5) {
-        onTrack = vec3<f32>(0.06, 0.48, 0.72); // grid: cyan blueprint
-    } else if (u.context < 2.5) {
-        onTrack = vec3<f32>(0.48, 0.24, 0.68); // motion: violet
+    if (uniforms.context_id < CTX_STATS_MAX) {
+        track_ink = TRACK_STATS;
+    } else if (uniforms.context_id < CTX_GRID_MAX) {
+        track_ink = TRACK_GRID;
+    } else if (uniforms.context_id < CTX_MOTION_MAX) {
+        track_ink = TRACK_MOTION;
     } else {
-        onTrack = vec3<f32>(0.78, 0.50, 0.08); // contrast: amber
+        track_ink = TRACK_CONTRAST;
     }
 
-    var col = mix(offTrack, onTrack, u.progress);
+    var color = mix(TRACK_OFF, track_ink, uniforms.switch_progress);
 
-    if (u.context < 0.5) {
-        // STATS — an ECG/heartbeat trace. waveX scrolls the trace right-
-        // to-left at 20px/s; the base sin(0.35 waveX) gives ±2.5px swell;
-        // the 36px-period window [12,18) adds the sharp spike: a
-        // triangular -2.8/px slope centered on phase 15 (rises 8.4px in
-        // 3px, falls 8.4px back — the classic QRS complex shape).
-        // `pulse * (0.3 + 0.7*progress)` damps the whole trace to 30%
-        // when the switch is off — heart barely beating.
-        let waveX = pixel.x + u.time * 20.0;
-        var pulse = sin(waveX * 0.35) * 2.5;
+    if (uniforms.context_id < CTX_STATS_MAX) {
+        // STATS — an ECG/heartbeat trace. wave_x scrolls the trace
+        // right-to-left; the base sine gives the swell; the ECG_PERIOD
+        // window adds the sharp spike (a triangular slope centered on
+        // ECG_SPIKE_CENTER — the classic QRS complex shape). The
+        // progress term damps the trace to 30% when off — heart
+        // barely beating.
+        let wave_x = pixel.x + uniforms.time_seconds * ECG_SCROLL_PX_S;
+        var pulse = sin(wave_x * ECG_FREQ) * ECG_SWELL;
 
-        let spikePhase = waveX % 36.0;
-        if (spikePhase > 12.0 && spikePhase < 18.0) {
-            pulse = pulse + (spikePhase - 15.0) * -2.8;
+        let spike_phase = wave_x % ECG_PERIOD;
+        if (spike_phase > ECG_SPIKE_LO && spike_phase < ECG_SPIKE_HI) {
+            pulse = pulse + (spike_phase - ECG_SPIKE_CENTER) * ECG_SPIKE_SLOPE;
         }
 
-        let waveY = 14.0 + pulse * (0.3 + 0.7 * u.progress);
-        let dWave = abs(pixel.y - waveY);
-        let waveGlow = 1.0 - smoothstep(0.0, 1.6, dWave);
-        let waveCol = mix(vec3<f32>(0.35, 0.40, 0.45), vec3<f32>(0.45, 1.0, 0.65), u.progress);
-        col = col + waveCol * waveGlow * 0.85;
-    } else if (u.context < 1.5) {
-        // GRID — blueprint hatch: vertical lines every 8px drifting at
-        // 3px/s + fixed horizontal lines every 7px. Each `abs(mod - c)`
-        // gives distance-to-nearest-line; the smoothstep turns it into a
-        // 1px-soft line mask; adding X+Y makes a crosshatch.
-        // Amplitude (0.25 + 0.55·progress): the blueprint fades IN as
-        // the toggle turns on — barely visible when off.
-        let gridX = (pixel.x + u.time * 3.0) % 8.0;
-        let gridY = pixel.y % 7.0;
-        let isLineX = 1.0 - smoothstep(0.0, 1.0, abs(gridX - 4.0));
-        let isLineY = 1.0 - smoothstep(0.0, 1.0, abs(gridY - 3.5));
-        let gridPattern = clamp(isLineX + isLineY, 0.0, 1.0);
-        let gridCol = mix(vec3<f32>(0.30, 0.35, 0.42), vec3<f32>(0.50, 0.85, 1.0), u.progress);
-        col = col + gridCol * gridPattern * (0.25 + 0.55 * u.progress);
-    } else if (u.context < 2.5) {
+        let wave_y = TRACK_Y_PX + pulse * (ECG_OFF_DAMP + ECG_ON_GAIN * uniforms.switch_progress);
+        let wave_dist = abs(pixel.y - wave_y);
+        let wave_glow = 1.0 - smoothstep(0.0, ECG_GLOW_WIDTH, wave_dist);
+        let wave_ink = mix(WAVE_DIM, WAVE_LIT, uniforms.switch_progress);
+        color = color + wave_ink * wave_glow * ECG_STRENGTH;
+    } else if (uniforms.context_id < CTX_GRID_MAX) {
+        // GRID — blueprint hatch: vertical lines drifting + fixed
+        // horizontals. Each `abs(mod − center)` gives distance-to-
+        // nearest-line; the smoothstep turns it into a soft line mask;
+        // adding X+Y makes a crosshatch. The blueprint fades IN as the
+        // toggle turns on — barely visible when off.
+        let grid_x = (pixel.x + uniforms.time_seconds * GRID_X_SCROLL) % GRID_X_PERIOD;
+        let grid_y = pixel.y % GRID_Y_PERIOD;
+        let is_line_x = 1.0 - smoothstep(0.0, GRID_LINE_SOFT, abs(grid_x - GRID_X_CENTER));
+        let is_line_y = 1.0 - smoothstep(0.0, GRID_LINE_SOFT, abs(grid_y - GRID_Y_CENTER));
+        let grid_pattern = clamp(is_line_x + is_line_y, 0.0, 1.0);
+        let grid_ink = mix(GRID_DIM, GRID_LIT, uniforms.switch_progress);
+        color = color + grid_ink * grid_pattern * (GRID_OFF_ALPHA + GRID_ON_GAIN * uniforms.switch_progress);
+    } else if (uniforms.context_id < CTX_MOTION_MAX) {
         // MOTION — when OFF (reduced-motion): diagonal comet streaks
-        // moving at 6px/s, fading over 12px of their 20px cycle.
-        // When ON: a single calm datum line at track center — the
-        // reduced-motion setting literally reduces the motion rendered.
-        if (u.progress < 0.5) {
-            let streakY = pixel.y % 7.0;
-            let streakMove = (pixel.x - u.time * 6.0) % 20.0;
-            let lineY = 1.0 - smoothstep(0.0, 1.2, abs(streakY - 3.5));
-            let lineFade = 1.0 - smoothstep(0.0, 12.0, streakMove);
-            col = col + vec3<f32>(0.85, 0.70, 1.0) * lineY * lineFade * 0.45;
+        // fading over their cycle. When ON: a single calm datum line —
+        // the reduced-motion setting literally reduces the motion
+        // rendered.
+        if (uniforms.switch_progress < 0.5) {
+            let streak_y = pixel.y % STREAK_Y_PERIOD;
+            let streak_move = (pixel.x - uniforms.time_seconds * STREAK_SCROLL) % STREAK_PERIOD;
+            let streak_line = 1.0 - smoothstep(0.0, STREAK_SOFT, abs(streak_y - STREAK_Y_CENTER));
+            let streak_fade = 1.0 - smoothstep(0.0, STREAK_FADE, streak_move);
+            color = color + STREAK_INK * streak_line * streak_fade * STREAK_ALPHA;
         } else {
-            let lineY = 1.0 - smoothstep(0.0, 1.2, abs(pixel.y - 14.0));
-            col = col + vec3<f32>(0.95, 0.85, 1.0) * lineY * 0.60;
+            let datum_line = 1.0 - smoothstep(0.0, DATUM_SOFT, abs(pixel.y - TRACK_Y_PX));
+            color = color + DATUM_INK * datum_line * DATUM_ALPHA;
         }
     } else {
         // CONTRAST — sweeping luminance split ("comparison wipe"): a
-        // vertical seam travels the track on a slow sine (±17px around
-        // center); left of it near-black, right near-white — the
-        // before/after split of a contrast comparator. Alpha
-        // (0.30 + 0.60·progress): the split fades IN as the toggle turns
-        // on — a soft grey hint when off. The amber seam is the
-        // comparator's cursor riding the boundary.
-        let seamX = 27.0 + sin(u.time * 0.9) * 17.0;
-        let side = smoothstep(seamX - 0.9, seamX + 0.9, pixel.x);
-        let wipeCol = mix(vec3<f32>(0.05, 0.05, 0.08), vec3<f32>(0.98, 0.98, 1.0), side);
-        col = mix(col, wipeCol, 0.30 + 0.60 * u.progress);
+        // vertical seam travels the track on a slow sine; left of it
+        // near-black, right near-white — the before/after split of a
+        // contrast comparator. The split fades IN as the toggle turns
+        // on — a soft grey hint when off. The seam is the comparator's
+        // cursor riding the boundary.
+        let seam_x = SEAM_CENTER + sin(uniforms.time_seconds * SEAM_SPEED) * SEAM_TRAVEL;
+        let wipe_side = smoothstep(seam_x - SEAM_SOFT, seam_x + SEAM_SOFT, pixel.x);
+        let wipe_ink = mix(WIPE_DARK, WIPE_LIGHT, wipe_side);
+        color = mix(color, wipe_ink, WIPE_OFF_ALPHA + WIPE_ON_GAIN * uniforms.switch_progress);
 
-        let seam = 1.0 - smoothstep(0.0, 1.0, abs(pixel.x - seamX));
-        col = col + vec3<f32>(1.0, 0.78, 0.30) * seam * (0.30 + 0.50 * u.progress);
+        let seam_cursor = 1.0 - smoothstep(0.0, SEAM_CURSOR_SOFT, abs(pixel.x - seam_x));
+        color = color + SEAM_INK * seam_cursor * (SEAM_OFF_ALPHA + SEAM_ON_GAIN * uniforms.switch_progress);
     }
 
-    // Inset bezel — a darkening ramp in the outer 2.5px of the track
-    // (trackDist 11.5→14) that makes the pill read as inset glass.
-    let bezel = smoothstep(11.5, 14.0, trackDist);
-    col = mix(col, vec3<f32>(0.0), bezel * 0.35);
+    // Inset bezel — the darkening ramp in the outer band of the track
+    // that makes the pill read as inset glass.
+    let bezel = smoothstep(BEZEL_LO, BEZEL_HI, track_dist);
+    color = mix(color, BEZEL_INK, bezel * BEZEL_STRENGTH);
 
     // ── The knob ─────────────────────────────────────────────────────
-    // A fake-3D sphere built from one distance field:
-    //   kShadow — a 2.5px soft shadow ring just past the knob edge.
-    //   kSphere — radial shading: `1 - (d/r)*0.15` darkens the rim 15% —
-    //     cheap Lambert-ish shading (no normals needed at this size).
-    //   dotLight — a 2.7px accent dot at knob center, tinted per context.
-    let knobCenter = vec2<f32>(u.knob_x, 14.0);
-    let knobDist = length(pixel - knobCenter);
-    let knobRadius = 11.0;
+    let knob_center = vec2<f32>(uniforms.knob_center_x, TRACK_Y_PX);
+    let knob_dist = length(pixel - knob_center);
 
-    let kShadow = (1.0 - smoothstep(knobRadius, knobRadius + 2.5, knobDist)) * 0.35;
-    col = mix(col, vec3<f32>(0.0), kShadow);
+    let knob_shadow = (1.0 - smoothstep(KNOB_RADIUS, KNOB_RADIUS + KNOB_SHADOW_WIDTH, knob_dist)) * KNOB_SHADOW_STRENGTH;
+    color = mix(color, KNOB_SHADOW_INK, knob_shadow);
 
-    let kSphere = 1.0 - clamp(knobDist / knobRadius, 0.0, 1.0) * 0.15;
-    var knobColor = vec3<f32>(0.98, 0.98, 1.0) * kSphere;
+    let sphere_shade = 1.0 - clamp(knob_dist / KNOB_RADIUS, 0.0, 1.0) * KNOB_RIM_DARKEN;
+    var knob_color = KNOB_SKIN * sphere_shade;
 
-    let dDot = length(pixel - knobCenter);
-    let dotLight = 1.0 - smoothstep(2.0, 2.7, dDot);
+    let dot_dist = length(pixel - knob_center);
+    let dot_light = 1.0 - smoothstep(DOT_RADIUS_LO, DOT_RADIUS_HI, dot_dist);
 
-    var dotCol: vec3<f32>;
-    if (u.context < 0.5) {
-        dotCol = mix(vec3<f32>(0.6, 0.65, 0.7), vec3<f32>(0.1, 0.85, 0.45), u.progress);
-    } else if (u.context < 1.5) {
-        dotCol = mix(vec3<f32>(0.6, 0.65, 0.7), vec3<f32>(0.1, 0.65, 0.95), u.progress);
-    } else if (u.context < 2.5) {
-        dotCol = mix(vec3<f32>(0.6, 0.65, 0.7), vec3<f32>(0.65, 0.4, 0.95), u.progress);
+    var dot_ink: vec3<f32>;
+    if (uniforms.context_id < CTX_STATS_MAX) {
+        dot_ink = mix(DOT_OFF, DOT_STATS, uniforms.switch_progress);
+    } else if (uniforms.context_id < CTX_GRID_MAX) {
+        dot_ink = mix(DOT_OFF, DOT_GRID, uniforms.switch_progress);
+    } else if (uniforms.context_id < CTX_MOTION_MAX) {
+        dot_ink = mix(DOT_OFF, DOT_MOTION, uniforms.switch_progress);
     } else {
-        dotCol = mix(vec3<f32>(0.6, 0.65, 0.7), vec3<f32>(1.0, 0.75, 0.25), u.progress);
+        dot_ink = mix(DOT_OFF, DOT_CONTRAST, uniforms.switch_progress);
     }
 
-    knobColor = mix(knobColor, dotCol, dotLight);
+    knob_color = mix(knob_color, dot_ink, dot_light);
 
-    let knobAA = 1.0 - smoothstep(knobRadius - 0.6, knobRadius + 0.4, knobDist);
-    col = mix(col, knobColor, knobAA);
+    let knob_alpha = 1.0 - smoothstep(KNOB_RADIUS + KNOB_AA_LO, KNOB_RADIUS + KNOB_AA_HI, knob_dist);
+    color = mix(color, knob_color, knob_alpha);
 
-    return vec4<f32>(col * borderAA, borderAA);
+    return vec4<f32>(color * border_alpha, border_alpha);
 }

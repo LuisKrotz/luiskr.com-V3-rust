@@ -36,8 +36,14 @@ pub const GROUP_LABEL_H: f32 = 26.0;
 
 /// Measured box size for a label: (w, h) in px.
 pub fn label_size(lines: &[String], theme: &Theme) -> (f32, f32) {
+    // Longest line's glyph count drives the width — multi-line labels
+    // are only as wide as their widest row.
     let chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1) as f32;
+
+    // Width: chars × em width × font size, plus side padding.
     let w = chars * theme.font_size * CHAR_W + PAD_X * 2.0;
+
+    // Height: line count × line height, plus vertical padding.
     let h = lines.len().max(1) as f32 * theme.font_size * LINE_H + PAD_Y * 2.0;
 
     (w, h)
@@ -60,6 +66,8 @@ pub fn centered_text(out: &mut String, cx: f32, cy: f32, lines: &[String], theme
         esc(&theme.fg),
     ));
 
+    // First line rides the <text>'s own baseline; subsequent lines
+    // become <tspan>s reset to cx and stepped down one line height.
     for (i, line) in lines.iter().enumerate() {
         if i == 0 {
             out.push_str(&esc(line));
@@ -87,11 +95,14 @@ pub fn edge_line(
     thick: bool,
     theme: &Theme,
 ) {
+    // Dashed edges get the 5-on/4-off dash pattern mermaid uses.
     let dash = if dashed {
         r#" stroke-dasharray="5,4""#
     } else {
         ""
     };
+
+    // `==>` edges draw nearly double-weight so they read as "thick".
     let w = if thick { 2.4 } else { 1.4 };
 
     out.push_str(&format!(
@@ -103,6 +114,8 @@ pub fn edge_line(
 /// A filled arrowhead triangle at (x2,y2) pointing along (dx,dy) — the
 /// tip lands ON the target's border so the head doesn't overshoot.
 pub fn arrow_head(out: &mut String, x2: f32, y2: f32, dx: f32, dy: f32, theme: &Theme) {
+    // Normalize the approach direction — the max() keeps a zero-length
+    // vector (a degenerate self-edge) from producing NaNs.
     let len = (dx * dx + dy * dy).sqrt().max(0.001);
     // Unit direction + 90° perpendicular for the wing offset.
     let (ux, uy) = (dx / len, dy / len);
@@ -126,6 +139,7 @@ pub fn arrow_head(out: &mut String, x2: f32, y2: f32, dx: f32, dy: f32, theme: &
 /// A small rounded chip behind an edge label — keeps text readable
 /// where the line passes beneath it (the surface color masks the line).
 pub fn label_chip(out: &mut String, cx: f32, cy: f32, lines: &[String], theme: &Theme) {
+    // Measure the label so the chip rect hugs the text exactly.
     let (w, h) = label_size(lines, theme);
 
     out.push_str(&format!(

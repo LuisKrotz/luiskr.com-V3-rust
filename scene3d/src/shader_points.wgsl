@@ -3,18 +3,17 @@
 // WebGPU has no gl_PointSize — point primitives rasterize as 1px.
 // The renderer instead expands every point into a 4-vertex billboard
 // quad at upload time (`expand_points` in renderer.rs): the vertex
-// stream's `pos` slot carries the shared point CENTER and `uv`
+// stream's `position` slot carries the shared point CENTER and `corner`
 // carries the quad CORNER (−1..1).
 //
-// Expansion happens in view space like the sprite shader, but cheaper:
-// the point is a camera-facing screen-aligned quad, so we can add the
-// corner offset AFTER view_proj by using the camera basis trick only
-// once — actually simpler still: we build the same world-basis the
-// sprite shader uses, since per-vertex cost is tiny (4 verts/point,
-// no fragment overdraw beyond the quad).
+// Expansion happens in world space via the shared camera-facing basis
+// (frame_uniform.wgsl's `camera_facing_basis` — the same rebuilt-basis
+// formulation the sprite shader uses): center → world → basis-offset
+// by corner·half_size → project. Per-vertex cost is tiny (4
+// verts/point, no fragment overdraw beyond the quad).
 //
 // Point size contract (mat_params.x): world-space half-size — the
-// quad's world radius. dpr compensation (canvas.w/dpr fields) is for
+// quad's world radius. dpr compensation (canvas.w field) is for
 // CSS-specified sizes; world-space sizes scale correctly through the
 // projection automatically — no dpr term needed.
 //
@@ -22,63 +21,59 @@
 // unit circle (corner length > 1) — square points look wrong in space
 // scenes — and applies a soft edge (smoothstep) for anti-aliasing
 // without MSAA-dependent alpha-to-coverage.
+//
+// Shared prelude: FrameUniforms, material bindings, and
+// camera_facing_basis come from frame_uniform.wgsl.
 
-struct Frame {
-    view_proj : mat4x4<f32>,
-    cam_pos   : vec3<f32>,
-    time      : f32,
-    _pad0     : vec4<f32>,
-    light_pos : vec3<f32>,
-    _pad1     : f32,
-    light_rgb : vec3<f32>,
-    _pad2     : f32,
-    light_int : f32,
-    _pad3     : vec3<f32>,
-    canvas    : vec4<f32>,
-    model     : mat4x4<f32>,
-    mat_color : vec4<f32>,
-    mat_emit  : vec4<f32>,
-    mat_params: vec4<f32>,   // [0] = world-space half-size
-    mat_flags : vec4<f32>,
-};
-
-@group(0) @binding(0) var<uniform> frame : Frame;
-@group(1) @binding(0) var tex : texture_2d<f32>;
-@group(1) @binding(1) var smp : sampler;
+/// Edge-AA start radius — alpha ramps 1→0 from 80% to 100% of the
+/// quad radius: wide enough to hide the quad edge at point sizes
+/// ≥4px, narrow enough that small points stay solid.
+const EDGE_FALLOFF_START = 0.8;
 
 struct VertexIn {
-    @location(0) pos    : vec3<f32>,   // point CENTER (shared by 4 verts)
-    @location(1) nrm    : vec3<f32>,   // unused — points are unlit
-    @location(2) corner : vec2<f32>,   // quad corner (−1..1), packed in uv
+    /// Point CENTER (shared by all 4 quad verts).
+    @location(0) position: vec3<f32>,
+    /// Unused — points are unlit.
+    @location(1) normal: vec3<f32>,
+    /// Quad corner (−1..1), packed into the uv attribute slot.
+    @location(2) corner: vec2<f32>,
 };
 
 struct VertexOut {
-    @builtin(position) clip   : vec4<f32>,
-    @location(0) corner       : vec2<f32>,
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) corner: vec2<f32>,
 };
 
-/// `vs_main` — billboard expansion via the same rebuilt-basis trick
-/// as the sprite shader (see shader_sprite.wgsl's doc): center →
-/// world → basis-offset by corner·half_size → project.
+/// `vs_main` — billboard expansion via the shared rebuilt-basis trick
+/// (see shader_sprite.wgsl's doc for why world-space beats clip-space
+/// tricks): center → world → basis-offset by corner·half_size →
+/// project.
 @vertex
-fn vs_main(v : VertexIn) -> VertexOut {
-    var out : VertexOut;
+fn vs_main(vert: VertexIn) -> VertexOut {
+    var out: VertexOut;
 
-    let center = (frame.model * vec4<f32>(v.pos, 1.0)).xyz;
-    let size   = frame.mat_params.x;
-    let fwd    = normalize(frame.cam_pos - center);
-    var up_hint = vec3<f32>(0.0, 1.0, 0.0);
+    // The shared point center in world space — all 4 corners of the
+    // quad start from the same position.
+    let center = (frame_uniforms.model * vec4<f32>(vert.position, 1.0)).xyz;
 
-    if (abs(dot(fwd, up_hint)) > 0.99) {
-        up_hint = vec3<f32>(0.0, 0.0, 1.0);
-    }
+    // World-space half-size from the material params row.
+    let half_size = frame_uniforms.mat_params.x;
 
-    let right = normalize(cross(up_hint, fwd));
-    let up    = cross(fwd, right);
-    let world = center + (right * v.corner.x + up * v.corner.y) * size;
+    // Screen-facing orthonormal basis — rebuilt from (camera →
+    // center) so the quad stares back at the eye (gimbal-guarded
+    // inside the shared helper).
+    let basis = camera_facing_basis(center);
 
-    out.clip   = frame.view_proj * vec4<f32>(world, 1.0);
-    out.corner = v.corner;
+    // Push this corner outward in the camera basis — the quad is
+    // screen-aligned by construction, sized by `half_size` world units.
+    let world_pos = center + (basis.right * vert.corner.x + basis.up * vert.corner.y) * half_size;
+
+    // Project the expanded corner to clip space.
+    out.clip_position = frame_uniforms.view_proj * vec4<f32>(world_pos, 1.0);
+
+    // Corner passes through — the fragment uses it for the circle
+    // falloff and uv reconstruction.
+    out.corner = vert.corner;
 
     return out;
 }
@@ -88,23 +83,22 @@ fn vs_main(v : VertexIn) -> VertexOut {
 /// The discard is a real `discard` (not alpha 0) — additive point
 /// clouds must not write transparent depth.
 @fragment
-fn fs_main(v : VertexOut) -> @location(0) vec4<f32> {
+fn fs_main(frag: VertexOut) -> @location(0) vec4<f32> {
     // Sample BEFORE the discard — implicit-derivative calls must sit
     // in unconditionally-uniform control flow; a post-discard call is
     // legal on most validators but demote-after-sample ordering is
     // universally safe and identical in output (the discarded
     // fragment never presents).
-    let r = length(v.corner);
-    let texel = textureSample(tex, smp, v.corner * 0.5 + vec2<f32>(0.5));
+    let radius = length(frag.corner);
+    let texel = textureSample(material_tex, material_sampler, frag.corner * 0.5 + vec2<f32>(0.5));
 
-    if (r > 1.0) {
+    if (radius > 1.0) {
         discard;
     }
 
-    // Edge AA: alpha ramps 1→0 over the outer 20% of the radius —
-    // wide enough to hide the quad edge at point sizes ≥4px, narrow
-    // enough that small points stay solid.
-    let alpha = 1.0 - smoothstep(0.8, 1.0, r);
+    // Edge AA: alpha ramps 1→0 over the outer EDGE_FALLOFF_START..1
+    // of the radius.
+    let alpha = 1.0 - smoothstep(EDGE_FALLOFF_START, 1.0, radius);
 
-    return (texel * frame.mat_color + frame.mat_emit) * alpha;
+    return unlit_composite(texel) * alpha;
 }

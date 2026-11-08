@@ -52,7 +52,7 @@ const WGSL: &str = include_str!("burn.wgsl");
 /// 32 KB covers a typical burn; the first overflow is a one-time
 /// realloc, not a per-frame cost.
 #[cfg(target_arch = "wasm32")]
-const START_CAP: usize = 512;
+const INITIAL_INSTANCE_CAPACITY: usize = 512;
 
 /// GPU state — surface + the instanced-quad resources.
 #[cfg(target_arch = "wasm32")]
@@ -62,13 +62,13 @@ struct Gpu {
     /// The instanced-quad pipeline.
     pipeline: web_sys::GpuRenderPipeline,
     /// Viewport uniform (16 B — vec2 + pad).
-    ubuf: web_sys::GpuBuffer,
-    /// Instance storage — capacity `inst_cap` records.
-    inst_buf: web_sys::GpuBuffer,
+    uniform_buffer: web_sys::GpuBuffer,
+    /// Instance storage — capacity `instance_capacity` records.
+    instance_buffer: web_sys::GpuBuffer,
     /// Instance capacity in records — geometric growth.
-    inst_cap: usize,
-    /// Bound resources — rebuilt whenever `inst_buf` regrows.
-    bind: web_sys::GpuBindGroup,
+    instance_capacity: usize,
+    /// Bound resources — rebuilt whenever `instance_buffer` regrows.
+    bind_group: web_sys::GpuBindGroup,
     /// Bind-group layout — kept for regrowth rebinds.
     layout: web_sys::GpuBindGroupLayout,
 }
@@ -86,7 +86,7 @@ pub struct Burn {
     /// emit path never allocates (zero-allocation frame rule).
     scratch: RefCell<Vec<f32>>,
     /// Canvas CSS px — the viewport uniform.
-    css: RefCell<[f32; 2]>,
+    viewport_css: RefCell<[f32; 2]>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -95,11 +95,14 @@ impl Burn {
     /// `Burn::new` — un-initialized surface; `init` must follow.
     #[wasm_bindgen(constructor)]
     pub fn new() -> Burn {
+        // Pre-init state: no GPU, no sim session. The scratch Vec is
+        // pre-sized to the starting capacity so the steady-state emit
+        // path never grows it (zero-allocation frame rule).
         Burn {
             gpu: RefCell::new(None),
             sim: RefCell::new(None),
-            scratch: RefCell::new(Vec::with_capacity(START_CAP * sim::QUAD_F32S)),
-            css: RefCell::new([1.0, 1.0]),
+            scratch: RefCell::new(Vec::with_capacity(INITIAL_INSTANCE_CAPACITY * sim::QUAD_F32S)),
+            viewport_css: RefCell::new([1.0, 1.0]),
         }
     }
 
@@ -110,40 +113,52 @@ impl Burn {
     /// @param device The shared GPUDevice (one per page, from the JS bridge).
     /// @returns Ok on a live surface, Err(JsValue) on failure.
     pub fn init(&self, canvas: HtmlCanvasElement, device: GpuDevice) -> Result<(), JsValue> {
+        // Step 1 — wrap the canvas in a configured surface.
         let surface = gpu_mini::init_surface(&canvas, &device)?;
 
-        // binding 0 uniform viewport · 1 storage instances — burn.wgsl.
+        // Step 2 — binding 0 uniform viewport · 1 storage instances —
+        // the two binding slots burn.wgsl declares.
         let layout = gpu_mini::new_layout(
             &surface.device,
             &[gpu_mini::uniform_entry(0), gpu_mini::storage_entry(1)],
         )?;
 
+        // Step 3 — compile the instanced-quad pipeline. The shader
+        // keeps its own vs_main (storage instancing), so it takes the
+        // helpers prelude (quad_corner), not the fullscreen triangle
+        // source.
+        let source = gpu_mini::wgsl::helpers_source(WGSL);
+
         let pipeline = gpu_mini::fullscreen_pipeline(
             &surface.device,
             surface.format,
-            WGSL,
+            &source,
             &[layout.clone()],
         )?;
 
-        let ubuf = gpu_mini::new_buffer(
+        // Step 4 — the 16 B viewport uniform (vec2 + pad).
+        let uniform_buffer = gpu_mini::new_buffer(
             &surface.device,
             16,
             gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST,
         )?;
 
-        let inst_cap = START_CAP;
-        let inst_buf = gpu_mini::new_buffer(
+        // Step 5 — the instance storage buffer at starting capacity
+        // (512 records × 64 B = 32 KB; regrowth is the cold path).
+        let instance_capacity = INITIAL_INSTANCE_CAPACITY;
+        let instance_buffer = gpu_mini::new_buffer(
             &surface.device,
-            (inst_cap * sim::QUAD_F32S * 4) as u32,
+            (instance_capacity * sim::QUAD_F32S * 4) as u32,
             gpu_buffer_usage::STORAGE | gpu_buffer_usage::COPY_DST,
         )?;
 
-        let bind = gpu_mini::new_bind_group(
+        // Step 6 — build the bind group once; regrowth rebinds.
+        let bind_group = gpu_mini::new_bind_group(
             &surface.device,
             &layout,
             &[
-                gpu_mini::bind_buffer_entry(0, &ubuf),
-                gpu_mini::bind_buffer_entry(1, &inst_buf),
+                gpu_mini::bind_buffer_entry(0, &uniform_buffer),
+                gpu_mini::bind_buffer_entry(1, &instance_buffer),
             ],
         );
 
@@ -153,13 +168,14 @@ impl Burn {
         let Ok(mut slot) = self.gpu.try_borrow_mut() else {
             return Err(JsValue::from_str("init: gpu slot poisoned"));
         };
+        // Publish the fully-bound scaffold — `frame` may now draw.
         *slot = Some(Gpu {
             surface,
             pipeline,
-            ubuf,
-            inst_buf,
-            inst_cap,
-            bind,
+            uniform_buffer,
+            instance_buffer,
+            instance_capacity,
+            bind_group,
             layout,
         });
 
@@ -170,37 +186,45 @@ impl Burn {
     /// `origin` is the widget's CSS-px offset inside the canvas;
     /// `seed` makes the xorshift deterministic per session.
     ///
-    /// @param dir +1.0 burn / −1.0 rebuild.
-    /// @param ox Widget origin X, canvas CSS px.
-    /// @param oy Widget origin Y, canvas CSS px.
+    /// @param direction +1.0 burn / −1.0 rebuild.
+    /// @param origin_x Widget origin X, canvas CSS px.
+    /// @param origin_y Widget origin Y, canvas CSS px.
     /// @param seed Deterministic xorshift seed (0 → session default).
-    pub fn begin(&self, dir: f32, ox: f32, oy: f32, seed: u32) {
-        if let Ok(mut s) = self.sim.try_borrow_mut() {
-            *s = Some(sim::BurnSim::new(dir, [ox, oy], seed));
+    pub fn begin(&self, direction: f32, origin_x: f32, origin_y: f32, seed: u32) {
+        // Mount a fresh sim session — replaces any prior one wholesale
+        // (a new hover starts a new burn, not a resume).
+        if let Ok(mut sim_slot) = self.sim.try_borrow_mut() {
+            *sim_slot = Some(sim::BurnSim::new(direction, [origin_x, origin_y], seed));
         }
     }
 
     /// `resize` — canvas-bitmap change → surface re-configure.
     ///
-    /// @param _w Device-pixel width (element-side).
-    /// @param _h Device-pixel height.
-    pub fn resize(&self, _w: u32, _h: u32) {
+    /// @param _width Device-pixel width (element-side).
+    /// @param _height Device-pixel height.
+    pub fn resize(&self, _width: u32, _height: u32) {
+        // Bail while init is in flight — the surface configures
+        // itself when it arrives.
         let Ok(gpu) = self.gpu.try_borrow() else {
             return;
         };
 
-        if let Some(g) = gpu.as_ref() {
-            gpu_mini::resize(&g.surface);
+        // Re-configure the live surface to match the new bitmap — the
+        // sim works in CSS px so only the surface needs the size.
+        if let Some(gpu_state) = gpu.as_ref() {
+            gpu_mini::resize(&gpu_state.surface);
         }
     }
 
     /// `set_size` — the canvas's CSS-pixel size (viewport uniform).
     ///
-    /// @param w Canvas width in CSS pixels.
-    /// @param h Canvas height in CSS pixels.
-    pub fn set_size(&self, w: f32, h: f32) {
-        if let Ok(mut c) = self.css.try_borrow_mut() {
-            *c = [w.max(1.0), h.max(1.0)];
+    /// @param width Canvas width in CSS pixels.
+    /// @param height Canvas height in CSS pixels.
+    pub fn set_size(&self, width: f32, height: f32) {
+        // CSS-px viewport — ≥1 clamp; the shader's CSS→NDC projection
+        // divides by it, so 0 would poison every particle position.
+        if let Ok(mut viewport) = self.viewport_css.try_borrow_mut() {
+            *viewport = [width.max(1.0), height.max(1.0)];
         }
     }
 
@@ -209,13 +233,15 @@ impl Burn {
     ///
     /// @param flat Flat f32 letter table.
     pub fn set_letters(&self, flat: &[f32]) {
-        let Ok(mut s_ref) = self.sim.try_borrow_mut() else {
+        let Ok(mut sim_ref) = self.sim.try_borrow_mut() else {
             return;
         };
 
-        if let Some(s) = s_ref.as_mut() {
+        // Forward to the mounted session — `None` (pre-`begin`) drops
+        // the table silently; the next mount pushes it again.
+        if let Some(session) = sim_ref.as_mut() {
 
-            s.set_letters(flat);
+            session.set_letters(flat);
         }
     }
 
@@ -224,13 +250,14 @@ impl Burn {
     ///
     /// @param ink One byte per pixel-column.
     pub fn set_ink(&self, ink: &[u8]) {
-        let Ok(mut s_ref) = self.sim.try_borrow_mut() else {
+        let Ok(mut sim_ref) = self.sim.try_borrow_mut() else {
             return;
         };
 
-        if let Some(s) = s_ref.as_mut() {
+        // Forward the column-occupancy mask to the live session.
+        if let Some(session) = sim_ref.as_mut() {
 
-            s.set_ink(ink);
+            session.set_ink(ink);
         }
     }
 
@@ -239,27 +266,30 @@ impl Burn {
     ///
     /// @param flat Flat f32 color table.
     pub fn set_colors(&self, flat: &[f32]) {
-        let Ok(mut s_ref) = self.sim.try_borrow_mut() else {
+        let Ok(mut sim_ref) = self.sim.try_borrow_mut() else {
             return;
         };
 
-        if let Some(s) = s_ref.as_mut() {
+        // Forward the tint table to the live session.
+        if let Some(session) = sim_ref.as_mut() {
 
-            s.set_colors(flat);
+            session.set_colors(flat);
         }
     }
 
     /// `set_dir` — +1 burn, −1 rebuild.
     ///
-    /// @param dir Direction discriminant.
-    pub fn set_dir(&self, dir: f32) {
-        let Ok(mut s_ref) = self.sim.try_borrow_mut() else {
+    /// @param direction Direction discriminant.
+    pub fn set_dir(&self, direction: f32) {
+        let Ok(mut sim_ref) = self.sim.try_borrow_mut() else {
             return;
         };
 
-        if let Some(s) = s_ref.as_mut() {
+        // Forward the direction flip — the sim drains its pools
+        // internally (burn ↔ rebuild hover toggle).
+        if let Some(session) = sim_ref.as_mut() {
 
-            s.set_dir(dir);
+            session.set_dir(direction);
         }
     }
 
@@ -267,30 +297,33 @@ impl Burn {
     /// bridge before `frame`.
     ///
     /// @param stage Global burn progress 0..1.
-    /// @param jag_amp Jagged-edge amplitude in px.
-    pub fn set_stage(&self, stage: f32, jag_amp: f32) {
-        let Ok(mut s_ref) = self.sim.try_borrow_mut() else {
+    /// @param jagged_amplitude Jagged-edge amplitude in px.
+    pub fn set_stage(&self, stage: f32, jagged_amplitude: f32) {
+        let Ok(mut sim_ref) = self.sim.try_borrow_mut() else {
             return;
         };
 
-        if let Some(s) = s_ref.as_mut() {
+        // Per-frame stage push — `tick` reads it parameter-free.
+        if let Some(session) = sim_ref.as_mut() {
 
-            s.set_stage(stage, jag_amp);
+            session.set_stage(stage, jagged_amplitude);
         }
     }
 
     /// `set_origin` — move the burn origin (the widget rect moved).
     ///
-    /// @param ox New origin X, canvas CSS px.
-    /// @param oy New origin Y, canvas CSS px.
-    pub fn set_origin(&self, ox: f32, oy: f32) {
-        let Ok(mut s_ref) = self.sim.try_borrow_mut() else {
+    /// @param origin_x New origin X, canvas CSS px.
+    /// @param origin_y New origin Y, canvas CSS px.
+    pub fn set_origin(&self, origin_x: f32, origin_y: f32) {
+        let Ok(mut sim_ref) = self.sim.try_borrow_mut() else {
             return;
         };
 
-        if let Some(s) = s_ref.as_mut() {
+        // Forward the origin move — a scrolling tile drags its whole
+        // flame front rather than burning in place.
+        if let Some(session) = sim_ref.as_mut() {
 
-            s.set_origin([ox, oy]);
+            session.set_origin([origin_x, origin_y]);
         }
     }
 
@@ -301,10 +334,13 @@ impl Burn {
     ///
     /// @returns Live particle count (0 when no sim is mounted).
     pub fn live_particles(&self) -> u32 {
+        // Chain of Options: borrow → session → count; any missing link
+        // (unborrowed, un-mounted) reports 0 — which conveniently IS
+        // the "idle" answer the JS loop wants anyway.
         self.sim
             .try_borrow()
             .ok()
-            .and_then(|r| r.as_ref().map(|s| s.live_count() as u32))
+            .and_then(|sim_ref| sim_ref.as_ref().map(|session| session.live_count() as u32))
             .unwrap_or(0)
     }
 
@@ -312,8 +348,8 @@ impl Burn {
     /// upload, draw. Per-frame cost: O(particles) scalar math + one
     /// instance write + one `draw(6, n)` — one JS→wasm crossing total.
     ///
-    /// @param dt Seconds since the previous call.
-    pub fn frame(&self, dt: f32) {
+    /// @param delta_seconds Seconds since the previous call.
+    pub fn frame(&self, delta_seconds: f32) {
         // Advance + emit — the scratch Vec keeps its heap capacity
         // across frames (zero-allocation rule).
         let Ok(mut scratch) = self.scratch.try_borrow_mut() else {
@@ -321,69 +357,95 @@ impl Burn {
         };
         scratch.clear();
 
-        if let Ok(mut s_ref) = self.sim.try_borrow_mut() {
-            if let Some(s) = s_ref.as_mut() {
-                s.tick(dt, &mut scratch);
+        // Advance the sim one tick — it appends quad records into the
+        // scratch; no session mounted → the Vec stays empty.
+        if let Ok(mut sim_ref) = self.sim.try_borrow_mut() {
+            if let Some(session) = sim_ref.as_mut() {
+                session.tick(delta_seconds, &mut scratch);
             }
         }
 
+        // Whole instance records emitted this tick.
         let count = scratch.len() / sim::QUAD_F32S;
 
         // Mutable scope — viewport write + instance-buffer regrowth.
         {
-            let Ok(mut g_mut) = self.gpu.try_borrow_mut() else {
+            let Ok(mut gpu_mut) = self.gpu.try_borrow_mut() else {
                 return;
             };
 
-            let Some(g) = g_mut.as_mut() else {
+            // Still `None` → init hasn't resolved.
+            let Some(gpu_state) = gpu_mut.as_mut() else {
                 return;
             };
 
-            // Viewport uniform — viewport_px + 2 f32 pad = 16 B.
-            let Ok(css_ref) = self.css.try_borrow() else {
+            // Viewport uniform — viewport_css + 2 f32 pad = 16 B.
+            // Copy the CSS size out of its cell, release the guard,
+            // THEN write — no RefCell guard crosses the queue call.
+            let Ok(viewport_ref) = self.viewport_css.try_borrow() else {
                 return;
             };
-            let css = *css_ref;
-            drop(css_ref);
-            gpu_mini::write_f32s(&g.surface.queue, &g.ubuf, &[css[0], css[1], 0.0, 0.0]);
+
+            let viewport = *viewport_ref;
+
+            drop(viewport_ref);
+
+            gpu_mini::write_f32s(
+                &gpu_state.surface.queue,
+                &gpu_state.uniform_buffer,
+                &[viewport[0], viewport[1], 0.0, 0.0],
+            );
 
             // Grow the instance buffer geometrically when the emit
             // overflows — bind groups are immutable, so regrow ⇒ rebind.
-            if count > 0 && count > g.inst_cap {
-                let old_cap = g.inst_cap;
+            if count > 0 && count > gpu_state.instance_capacity {
+                // Remember the old capacity so a failed regrow can
+                // roll the bookkeeping back to the still-live buffer.
+                let old_capacity = gpu_state.instance_capacity;
 
-                while count > g.inst_cap {
-                    g.inst_cap *= 2;
+                // Geometric growth — double until the emit fits; the
+                // realloc cost lands once per scale-up, never steadily.
+                while count > gpu_state.instance_capacity {
+                    gpu_state.instance_capacity *= 2;
                 }
 
                 // A device fault mid-regrow keeps the old (too-small)
                 // buffer — the frame draws truncated rather than
                 // panicking inside the rAF callback.
-                if let Ok(inst_buf) = gpu_mini::new_buffer(
-                    &g.surface.device,
-                    (g.inst_cap * sim::QUAD_F32S * 4) as u32,
+                if let Ok(instance_buffer) = gpu_mini::new_buffer(
+                    &gpu_state.surface.device,
+                    (gpu_state.instance_capacity * sim::QUAD_F32S * 4) as u32,
                     gpu_buffer_usage::STORAGE | gpu_buffer_usage::COPY_DST,
                 ) {
-                    g.inst_buf = inst_buf;
+                    // Swap in the grown buffer…
+                    gpu_state.instance_buffer = instance_buffer;
 
-                    g.bind = gpu_mini::new_bind_group(
-                        &g.surface.device,
-                        &g.layout,
+                    // …and rebuild the bind group against it — groups
+                    // are immutable, so a buffer swap means a rebind.
+                    gpu_state.bind_group = gpu_mini::new_bind_group(
+                        &gpu_state.surface.device,
+                        &gpu_state.layout,
                         &[
-                            gpu_mini::bind_buffer_entry(0, &g.ubuf),
-                            gpu_mini::bind_buffer_entry(1, &g.inst_buf),
+                            gpu_mini::bind_buffer_entry(0, &gpu_state.uniform_buffer),
+                            gpu_mini::bind_buffer_entry(1, &gpu_state.instance_buffer),
                         ],
                     );
                 } else {
-                    g.inst_cap = old_cap;
+                    // Regrow failed — restore the capacity so the
+                    // bookkeeping still describes the old buffer.
+                    gpu_state.instance_capacity = old_capacity;
                 }
             }
 
+            // Upload this frame's instance records — skipped when the
+            // emit was empty (nothing to write).
             if count > 0 {
-                gpu_mini::write_f32s(&g.surface.queue, &g.inst_buf, &scratch);
+                gpu_mini::write_f32s(&gpu_state.surface.queue, &gpu_state.instance_buffer, &scratch);
             }
         }
 
+        // Release the scratch borrow BEFORE the draw section — the
+        // same no-guard-across-JS-boundary rule.
         drop(scratch);
 
         // Immutable scope — draw with whatever bind group is live.
@@ -391,68 +453,27 @@ impl Burn {
             return;
         };
 
-        let Some(g) = gpu.as_ref() else {
+        // Still `None` → init hasn't resolved.
+        let Some(gpu_state) = gpu.as_ref() else {
             return;
         };
 
-        if !draw_instanced(&g.surface, &g.pipeline, &g.bind, count as u32) {
-            gpu_mini::resize(&g.surface);
+        // One instanced draw for every live particle; a stale/lost
+        // surface re-configures itself for next frame. The `.max(1)`
+        // keeps the pass alive on an empty emit so the clear still
+        // composites (a fully-dead burn must erase its last frame,
+        // not freeze it).
+        if !gpu_mini::draw_n(
+            &gpu_state.surface,
+            &gpu_state.pipeline,
+            &gpu_state.bind_group,
+            None,
+            6,
+            (count as u32).max(1),
+        ) {
+            gpu_mini::resize(&gpu_state.surface);
         }
     }
-}
-
-/// `draw_instanced` — the burn draw: fullscreen-quad topology, 6 verts
-/// × `instances`. Like `gpu_mini::draw` but with an instance count.
-///
-/// @param surface The live surface.
-/// @param pipeline The instanced-quad pipeline.
-/// @param bind Its bind group.
-/// @param instances Live instance count.
-/// @returns true when a frame was submitted.
-#[cfg(target_arch = "wasm32")]
-fn draw_instanced(
-    surface: &gpu_mini::Surface,
-    pipeline: &web_sys::GpuRenderPipeline,
-    bind: &web_sys::GpuBindGroup,
-    instances: u32,
-) -> bool {
-    let tex = match surface.context.get_current_texture() {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-
-    let view = match tex.create_view() {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-
-    let clear = web_sys::GpuColorDict::new(0.0, 0.0, 0.0, 0.0);
-    let attach = web_sys::GpuRenderPassColorAttachment::new_with_gpu_texture_view(
-        web_sys::GpuLoadOp::Clear,
-        web_sys::GpuStoreOp::Store,
-        &view,
-    );
-    attach.set_clear_value_gpu_color_dict(&clear);
-
-    let attachments = [js_sys::JsNullable::wrap(attach)];
-    let pass_desc = web_sys::GpuRenderPassDescriptor::new(&attachments);
-
-    let encoder = surface
-        .device
-        .create_command_encoder_with_descriptor(&web_sys::GpuCommandEncoderDescriptor::new());
-
-    match encoder.begin_render_pass(&pass_desc) {
-        Ok(pass) => {
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, Some(bind));
-            pass.draw_with_instance_count(6, instances.max(1));
-            pass.end();
-        }
-        Err(_) => return false,
-    }
-
-    surface.queue.submit(&[encoder.finish()]);
-    true
 }
 
 /// `destroy` parity — forget the GPU state instead of destructing
@@ -463,8 +484,8 @@ fn draw_instanced(
 #[cfg(target_arch = "wasm32")]
 impl Drop for Burn {
     fn drop(&mut self) {
-        if let Some(g) = self.gpu.get_mut().take() {
-            std::mem::forget(g);
+        if let Some(gpu_state) = self.gpu.get_mut().take() {
+            std::mem::forget(gpu_state);
         }
     }
 }

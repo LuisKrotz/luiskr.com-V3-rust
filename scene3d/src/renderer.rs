@@ -164,7 +164,10 @@ impl Renderer {
     /// @returns The ready renderer, or Err so `mount` rejects to the
     ///   JS fallback instead of panicking inside the async future.
     pub fn new(surface: Surface, w: u32, h: u32) -> Result<Renderer, JsValue> {
+        // Borrow the device/queue handles out of the surface — every
+        // resource below is created against them.
         let device = &surface.device;
+
         let queue = &surface.queue;
 
         // group(0): the frame uniform — VERTEX|FRAGMENT visibility
@@ -175,14 +178,20 @@ impl Renderer {
         // group(1): {texture, sampler} — the per-material texture bind.
         let tex_layout = new_layout(device, &[texture_entry(0), sampler_entry(1)])?;
 
+        // The one shared uniform buffer — camera block at [0..48),
+        // per-draw model+material at [48..96).
         let frame_buf = new_buffer(
             device,
             (FRAME_F32S * 4) as u32,
             gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST,
         )?;
+
+        // group(0)'s bind group — created once, bound identically for
+        // every draw (the per-draw data lives in the same buffer).
         let frame_group =
             new_bind_group(device, &frame_layout, &[bind_buffer_entry(0, &frame_buf)]);
 
+        // Shared bilinear sampler — every texture binds the same one.
         let sampler = linear_sampler(device);
 
         // The 1×1 white texture — see module doc: untextured materials
@@ -199,6 +208,8 @@ impl Renderer {
             ],
         );
 
+        // Assemble the renderer — registries start empty; JS pushes
+        // geometries/materials/textures through the upload calls.
         let mut r = Renderer {
             surface,
             geos: Vec::new(),
@@ -223,21 +234,26 @@ impl Renderer {
         // The shared sprite billboard — a unit quad whose corner attr
         // drives the view-space expansion in the sprite shader.
         let mut quad = Geometry::default();
+
         for (i, c) in CORNERS.iter().enumerate() {
             quad.push_vertex(
                 Vec3::new(c[0], c[1], 0.0),
                 Vec3::new(0.0, 0.0, 1.0),
                 [c[0] * 0.5 + 0.5, c[1] * 0.5 + 0.5],
             );
+
             let _ = i;
         }
+
         quad.indices = QUAD_IDX.to_vec();
 
         // A fault here leaves quad_geo = u32::MAX — sprite draws
         // resolve to a registry miss and skip rather than panicking.
         r.quad_geo = r.upload_geometry(&quad, false).unwrap_or(u32::MAX);
 
+        // Initial depth bake + surface configure for the mount size.
         r.resize(w, h);
+
         Ok(r)
     }
 
@@ -297,6 +313,8 @@ impl Renderer {
     ///   blocked the buffer upload (callers pass u32::MAX to JS —
     ///   frame-time lookups resolve to a registry miss and skip).
     pub fn upload_geometry(&mut self, g: &Geometry, as_points: bool) -> Option<u32> {
+        // Point clouds expand to quads at upload (see module doc) —
+        // everything else uploads its SoA buffers verbatim.
         let (positions, normals, uvs, indices) = if as_points {
             expand_points(g)
         } else {
@@ -308,7 +326,10 @@ impl Renderer {
             )
         };
 
+        // Interleave SoA → AoS: one 32 B record per vertex (pos3 +
+        // nrm3 + uv2) — one vertex buffer covers all three attributes.
         let n = positions.len() / 3;
+
         let mut interleaved = vec![0.0f32; n * 8];
 
         for i in 0..n {
@@ -324,6 +345,8 @@ impl Renderer {
             interleaved[o + 7] = uvs[i * 2 + 1];
         }
 
+        // Both buffers must land — a device fault on either reports
+        // None so callers degrade to a registry miss, not a panic.
         let (Ok(vertex), Ok(index)) = (
             new_buffer(
                 &self.surface.device,
@@ -339,11 +362,15 @@ impl Renderer {
             return None;
         };
 
+        // Upload the interleaved vertex stream…
         let _ = self.surface.queue.write_buffer_with_u32_and_u8_slice(
             &vertex,
             0,
             f32_bytes(&interleaved),
         );
+
+        // …and the u32 index table — viewed as raw bytes (u32 indices
+        // are byte-identical, no cast helper exists for them).
         let _ = self
             .surface
             .queue
@@ -351,6 +378,8 @@ impl Renderer {
                 std::slice::from_raw_parts(indices.as_ptr().cast::<u8>(), indices.len() * 4)
             });
 
+        // Register — the returned id is the Vec index, stable for the
+        // renderer's lifetime.
         self.geos.push(Geo {
             vertex,
             index,
@@ -368,11 +397,14 @@ impl Renderer {
     /// @returns The texture registry id, or None on a device fault —
     ///   materials holding u32::MAX bind the white fallback.
     pub fn upload_texture(&mut self, bitmap: &ImageBitmap, w: u32, h: u32) -> Option<u32> {
+        // GPU→GPU copy — a device fault degrades to None so materials
+        // fall back to the white texture rather than panic.
         let Ok(tex) = bitmap_texture(&self.surface.device, &self.surface.queue, bitmap, w, h)
         else {
             return None;
         };
 
+        // Bind groups need views, not textures — create it now.
         let Ok(v) = view(&tex) else {
             return None;
         };
@@ -388,10 +420,16 @@ impl Renderer {
     /// @param record The material description.
     /// @returns The material registry id.
     pub fn add_material(&mut self, record: Record) -> u32 {
+        // Which texture (if any) this material wants.
         let tex_id = material_texture(&record.material);
+
+        // Missing/unregistered texture → the shared white fallback so
+        // the shader's tex·color multiply is unconditional.
         let bind = if tex_id == u32::MAX || self.texs.get(tex_id as usize).is_none() {
             self.white_bind.clone()
         } else {
+            // Real texture → build its group(1) bind group now; bind
+            // groups are immutable so it's built once at registration.
             new_bind_group(
                 &self.surface.device,
                 &self.tex_layout,
@@ -412,6 +450,7 @@ impl Renderer {
     ///
     /// @param mat Material id. @param flags The new flag set.
     pub fn set_flags(&mut self, mat: u32, flags: crate::material::Flags) {
+        // Registry-miss → silent no-op (stale ids are legal).
         if let Some(m) = self.mats.get_mut(mat as usize) {
             m.record.flags = flags;
         }
@@ -421,6 +460,7 @@ impl Renderer {
     ///
     /// @param mat Material id. @param emissive rgba 0-1.
     pub fn set_emissive(&mut self, mat: u32, emissive: [f32; 4]) {
+        // Registry-miss → silent no-op.
         if let Some(m) = self.mats.get_mut(mat as usize) {
             m.record.emissive = emissive;
         }
@@ -433,7 +473,11 @@ impl Renderer {
     ///
     /// @param mat Material id. @param color rgba 0-1.
     pub fn set_color(&mut self, mat: u32, color: [f32; 4]) {
+        // Registry-miss → silent no-op.
         if let Some(m) = self.mats.get_mut(mat as usize) {
+            // One match arm covers every variant — each carries its
+            // color under the same field name so the or-pattern writes
+            // them uniformly.
             match &mut m.record.material {
                 crate::material::Material::Basic { color: c, .. }
                 | crate::material::Material::Standard { color: c, .. }
@@ -450,26 +494,43 @@ impl Renderer {
     /// descriptor — the draw is skipped rather than panicking inside
     /// a frame callback.
     fn pipe(&mut self, key: PipeKey, kind: u8) -> Option<GpuRenderPipeline> {
+        // Cache hit → return the already-compiled pipeline (clone is
+        // a refcount bump on the JsValue handle, not a rebuild).
         if let Some(p) = self.pipes.get(&key) {
             return Some(p.clone());
         }
 
+        // Kind → which WGSL module to compile. Every pipeline source
+        // is frame_uniform.wgsl (the shared FrameUniforms block +
+        // material bindings + billboard/composite helpers) prepended
+        // to the kind's own stage code — concat! keeps the join at
+        // compile time, so the group(0) layout is identical across
+        // pipelines by construction.
         let wgsl = match kind {
-            1 => include_str!("shader_standard.wgsl"),
-            2 => include_str!("shader_sprite.wgsl"),
-            3 => include_str!("shader_points.wgsl"),
-            4 => include_str!("shader_instanced.wgsl"),
-            _ => include_str!("shader_basic.wgsl"),
+            1 => concat!(include_str!("frame_uniform.wgsl"), include_str!("shader_standard.wgsl")),
+            2 => concat!(include_str!("frame_uniform.wgsl"), include_str!("shader_sprite.wgsl")),
+            3 => concat!(include_str!("frame_uniform.wgsl"), include_str!("shader_points.wgsl")),
+            4 => concat!(include_str!("frame_uniform.wgsl"), include_str!("shader_instanced.wgsl")),
+            _ => concat!(include_str!("frame_uniform.wgsl"), include_str!("shader_basic.wgsl")),
         };
+
+        // Side index → cull mode: Front culls back faces, Back culls
+        // front, Double disables culling entirely.
         let side = match key.1 {
             1 => GpuCullMode::Front,
             2 => GpuCullMode::None,
             _ => GpuCullMode::Back,
         };
+
+        // Blend index 1 = additive glow accumulation.
         let additive = key.2 == 1;
+
+        // Compile + validate — None degrades to a skipped draw.
         let p = self.build_pipeline(wgsl, side, additive, kind == 4)?;
 
+        // Cache so the next draw of this state tuple skips compile.
         self.pipes.insert(key, p.clone());
+
         Some(p)
     }
 
@@ -484,11 +545,19 @@ impl Renderer {
         instanced: bool,
     ) -> Option<GpuRenderPipeline> {
         let device = &self.surface.device;
+
+        // Compile the WGSL module — validation errors surface at
+        // pipeline creation (the .ok() below returns None).
         let shader = device.create_shader_module(&GpuShaderModuleDescriptor::new(wgsl));
+
+        // Two-group layout: group(0) frame uniform, group(1)
+        // {texture, sampler} — identical across every pipeline so the
+        // same bind groups serve all draws.
         let layout_arr = [
             js_sys::JsNullable::wrap(self.frame_layout.clone()),
             js_sys::JsNullable::wrap(self.tex_layout.clone()),
         ];
+
         let layout = device.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&layout_arr));
 
         // Vertex buffer: one interleaved stream, 32B stride, three
@@ -515,9 +584,14 @@ impl Renderer {
         let inst_buf = GpuVertexBufferLayout::new(64, &inst_attrs);
         inst_buf.set_step_mode(GpuVertexStepMode::Instance);
 
+        // Two vertex states: mesh pipelines take slot 0 only;
+        // instanced pipelines take slot 0 + the per-instance slot 1.
         let vertex_inst = GpuVertexState::new(&shader);
+
         vertex_inst.set_entry_point("vs_main");
+
         vertex.set_buffers(&[js_sys::JsNullable::wrap(buf.clone())]);
+
         vertex_inst.set_buffers(&[
             js_sys::JsNullable::wrap(buf),
             js_sys::JsNullable::wrap(inst_buf),
@@ -527,37 +601,61 @@ impl Renderer {
         // src+dst one-sided accumulate (order-independent, so the
         // transparent sort can skip these draws entirely).
         let comp = GpuBlendComponent::new();
+
         if additive {
+            // src+dst straight accumulation — order-independent.
             comp.set_src_factor(GpuBlendFactor::One);
             comp.set_dst_factor(GpuBlendFactor::One);
         } else {
+            // Source-over: src·1 + dst·(1−α).
             comp.set_src_factor(GpuBlendFactor::One);
             comp.set_dst_factor(GpuBlendFactor::OneMinusSrcAlpha);
         }
+
         comp.set_operation(GpuBlendOperation::Add);
+
+        // Same component for color and alpha — a uniform blend state.
         let blend = GpuBlendState::new(&comp, &comp);
 
+        // Color target in the surface's negotiated format.
         let target = GpuColorTargetState::new(self.surface.format);
+
         target.set_blend(&blend);
+
         let targets = [js_sys::JsNullable::wrap(target)];
+
         let fragment = GpuFragmentState::new(&shader, &targets);
+
         fragment.set_entry_point("fs_main");
 
+        // Depth: additive glows test but never write — they must not
+        // occlude the particles behind them.
         let depth = GpuDepthStencilState::new(GpuTextureFormat::Depth24plus);
+
         depth.set_depth_write_enabled(!additive);
+
         depth.set_depth_compare(GpuCompareFunction::LessEqual);
 
+        // Primitive state — CCW front faces, per-key cull mode.
         let prim = GpuPrimitiveState::new();
+
         prim.set_cull_mode(cull);
+
         prim.set_topology(GpuPrimitiveTopology::TriangleList);
+
         prim.set_front_face(GpuFrontFace::Ccw);
 
+        // Assemble + validate — a driver-side rejection degrades to
+        // None; the caller skips the draw.
         let desc = GpuRenderPipelineDescriptor::new(
             &layout,
             if instanced { &vertex_inst } else { &vertex },
         );
+
         desc.set_fragment(&fragment);
+
         desc.set_depth_stencil(&depth);
+
         desc.set_primitive(&prim);
 
         device.create_render_pipeline(&desc).ok()
@@ -594,6 +692,7 @@ impl Renderer {
     ) {
         let (w, h) = self.size;
 
+        // Zero-sized canvas (hidden/unlaid-out) → nothing to draw.
         if w == 0 || h == 0 {
             return;
         }
@@ -602,6 +701,7 @@ impl Renderer {
         let mut block = [0.0f32; FRAME_F32S];
 
         cam.write_frame_uniform(&mut block, w as f32, h as f32, dpr, time, light);
+
         write_f32s(&self.surface.queue, &self.frame_buf, &block);
 
         // Stale surface (resize mid-frame, occluded tab) → skip the
@@ -618,22 +718,35 @@ impl Renderer {
             return;
         };
 
+        // Depth attachment — clear to far (1.0) each frame, stored so
+        // the transparent pass can test against opaque depth.
         let depth_att = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&depth_view);
+
         depth_att.set_depth_clear_value(1.0);
+
         depth_att.set_depth_load_op(GpuLoadOp::Clear);
+
         depth_att.set_depth_store_op(GpuStoreOp::Store);
 
+        // Color attachment — clear to the page-composite color.
         let color_att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(
             GpuLoadOp::Clear,
             GpuStoreOp::Store,
             &view,
         );
+
         let clear = GpuColorDict::new(clear_rgba[0], clear_rgba[1], clear_rgba[2], clear_rgba[3]);
+
         color_att.set_clear_value_gpu_color_dict(&clear);
+
         let attachments = [js_sys::JsNullable::wrap(color_att)];
+
         let desc = GpuRenderPassDescriptor::new(&attachments);
+
         desc.set_depth_stencil_attachment(&depth_att);
 
+        // One encoder per frame — the whole scene submits as one
+        // command buffer.
         let encoder = self
             .surface
             .device
@@ -654,13 +767,19 @@ impl Renderer {
         // rule — no per-frame Vec).
         let (list, _lods) = scene.collect(cam.layers);
 
+        // Copy the id list into reusable scratch — the returned slice
+        // borrows `scene` mutably while the loop needs shared access.
         self.scratch.clear();
+
         self.scratch.extend_from_slice(list);
 
+        // Length captured once — the loop must not re-read scratch
+        // through the node borrow below.
         let list_end = self.scratch.len();
 
         for li in 0..list_end {
             let id = self.scratch[li];
+
             let node = &scene.nodes[id.0 as usize];
 
             // Node kind → (geometry, material, shader kind, instanced):
@@ -748,16 +867,22 @@ impl Renderer {
                 }
             }
 
+            // Material flags → the pipeline-key side byte.
             let side_idx = match record.flags.side {
                 Side::Front => 0u8,
                 Side::Back => 1,
                 Side::Double => 2,
             };
+
+            // Blending → the key's blend byte (additive = 1).
             let blend_idx = if record.flags.blending == Blending::Additive {
                 1
             } else {
                 0
             };
+
+            // Fetch-or-create the pipeline — a validation failure
+            // skips the draw rather than panicking mid-pass.
             let Some(pipe) = self.pipe(PipeKey(kind, side_idx, blend_idx), kind) else {
                 continue;
             };
@@ -767,24 +892,38 @@ impl Renderer {
             // the camera block at [0..48) survives every draw write.
             let mut block = [0.0f32; 48];
 
+            // [0..16) world matrix — the node's composed transform.
             block[0..16].copy_from_slice(&node.world.m);
+
+            // [16..48) the material's 32-f32 pack.
             record.pack(&mut block[16..48]);
 
+            // Write only the draw half of the shared buffer — the
+            // camera block at [0..48) survives every per-draw write.
             let _ = self.surface.queue.write_buffer_with_u32_and_u8_slice(
                 &self.frame_buf,
                 192,
                 f32_bytes(&block),
             );
 
+            // Bind everything: pipeline, the shared frame group, this
+            // material's texture group, and the mesh's vertex/index.
             pass.set_pipeline(&pipe);
+
             pass.set_bind_group(0, Some(&self.frame_group));
+
             pass.set_bind_group(1, Some(&mat_bind));
+
             pass.set_vertex_buffer(0, Some(&geo_v));
+
             pass.set_index_buffer(&geo_i, GpuIndexFormat::Uint32);
 
             if instanced {
+                // Instanced draws bind slot 1 too — a missing buffer
+                // (failed regrow) silently draws nothing this frame.
                 if let Some((inst_buf, _)) = self.inst_bufs.get(&id.0) {
                     pass.set_vertex_buffer(1, Some(inst_buf));
+
                     pass.draw_indexed_with_instance_count(geo_count, node.instances.len() as u32);
                 }
             } else {
@@ -796,7 +935,9 @@ impl Renderer {
 
         let _ = post; // Post chain lands in post.rs — stubbed this pass.
 
+        // Finish + submit — the whole scene was one command buffer.
         let cmd = encoder.finish();
+
         self.surface.queue.submit(&[cmd]);
     }
 }
@@ -818,19 +959,29 @@ fn material_texture(m: &Material) -> u32 {
 /// stay centered — the shader offsets by corner×size in view space.
 fn expand_points(g: &Geometry) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u32>) {
     let n = g.vertex_count();
+
+    // Pre-size all four output arrays — 4 verts + 6 indices per point.
     let mut p = Vec::with_capacity(n * 12);
+
     let mut nr = Vec::with_capacity(n * 12);
+
     let mut uv = Vec::with_capacity(n * 8);
+
     let mut ix = Vec::with_capacity(n * 6);
 
     for i in 0..n {
+        // The source point's center position + normal — all four quad
+        // corners share them (the shader offsets by corner×size).
         let (px, py, pz) = (
             g.positions[i * 3],
             g.positions[i * 3 + 1],
             g.positions[i * 3 + 2],
         );
+
         let (nx, ny, nz) = (g.normals[i * 3], g.normals[i * 3 + 1], g.normals[i * 3 + 2]);
 
+        // Emit the 4 corners — identical pos/nrm; the corner attribute
+        // is what distinguishes them.
         for c in CORNERS.iter() {
             p.extend_from_slice(&[px, py, pz]);
             nr.extend_from_slice(&[nx, ny, nz]);
@@ -840,7 +991,10 @@ fn expand_points(g: &Geometry) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u32>) {
             uv.extend_from_slice(&[c[0], c[1]]);
         }
 
+        // Two triangles for this point's quad, offset to its 4-vert
+        // base index.
         let base = (i * 4) as u32;
+
         let quad: Vec<u32> = QUAD_IDX.iter().map(|x| x + base).collect();
 
         ix.extend_from_slice(&quad);

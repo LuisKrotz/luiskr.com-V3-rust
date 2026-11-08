@@ -101,15 +101,20 @@ impl Camera {
         // Clamp pitch just off the poles — look_at's up-vector cross
         // degenerates exactly at ±90° (see Orbit.pitch doc).
         let pitch = o.pitch.clamp(-1.56, 1.56);
+
         let (sp, cp) = pitch.sin_cos();
+
         let (sy, cy) = o.yaw.sin_cos();
 
+        // Spherical→cartesian: the eye orbits `target` at `distance`.
         self.position = Vec3::new(
             o.target.x + o.distance * cp * sy,
             o.target.y + o.distance * sp,
             o.target.z + o.distance * cp * cy,
         );
 
+        // Face the target — look_at builds the view; transposing its
+        // 3×3 back to world orientation gives the camera's rotation.
         let view = Mat4::look_at(self.position, o.target, Vec3::new(0.0, 1.0, 0.0));
 
         self.rotation = Quat::from_mat4(&view_rot_to_world(&view));
@@ -131,13 +136,18 @@ impl Camera {
             -self.rotation.z,
             self.rotation.w,
         );
+
+        // R⁻¹ as a matrix.
         let rot = qi.to_mat4();
+
+        // T⁻¹ — move the world so the eye sits at the origin.
         let tra = Mat4::translation(Vec3::new(
             -self.position.x,
             -self.position.y,
             -self.position.z,
         ));
 
+        // view = R⁻¹ · T⁻¹ — rotate after un-translating.
         rot.mul(tra)
     }
 
@@ -169,27 +179,59 @@ impl Camera {
         time: f32,
         light: (Vec3, Vec3, f32),
     ) {
+        // Resolve the rig first — a frame write must reflect this
+        // frame's orbit params.
         self.apply_orbit();
 
+        // Clamp the aspect divisor — a zero-height canvas (hidden or
+        // unlaid-out) must not produce NaNs in the projection.
         let aspect = canvas_w / canvas_h.max(1.0);
+
+        // proj·view — the combined clip transform (view applied first).
         let vp = self.proj(aspect).mul(self.view());
 
+        // Zero the whole block first — reserved slots read as 0.
         out.fill(0.0);
+
+        // [0..16] view_proj — column-major mat4, bytemuck-compatible.
         out[0..16].copy_from_slice(&vp.m);
+
+        // [16..19] eye position — specular/reflection vectors need it.
         out[16] = self.position.x;
+
         out[17] = self.position.y;
+
         out[18] = self.position.z;
+
+        // [19] shader animation clock.
         out[19] = time;
+
+        // [24..27] point-light world position.
         out[24] = light.0.x;
+
         out[25] = light.0.y;
+
         out[26] = light.0.z;
+
+        // [28..31] light rgb.
         out[28] = light.1.x;
+
         out[29] = light.1.y;
+
         out[30] = light.1.z;
+
+        // [32] light intensity (range slot stays 0 — scenes don't
+        // attenuate).
         out[32] = light.2;
+
+        // [36..39] canvas block: dims + 1/h + dpr — the point-size
+        // shader scales sprites by these.
         out[36] = canvas_w;
+
         out[37] = canvas_h;
+
         out[38] = 1.0 / canvas_h.max(1.0);
+
         out[39] = dpr;
     }
 }
@@ -204,14 +246,25 @@ impl Camera {
 pub(crate) fn view_rot_to_world(view: &Mat4) -> Mat4 {
     let mut m = Mat4::IDENTITY.m;
 
+    // Transpose the view's upper-left 3×3 — for an orthonormal basis,
+    // Rᵀ = R⁻¹, so the view's rotation columns become the world's
+    // orientation columns without a general inverse.
     m[0] = view.m[0];
+
     m[1] = view.m[4];
+
     m[2] = view.m[8];
+
     m[4] = view.m[1];
+
     m[5] = view.m[5];
+
     m[6] = view.m[9];
+
     m[8] = view.m[2];
+
     m[9] = view.m[6];
+
     m[10] = view.m[10];
 
     Mat4 { m }

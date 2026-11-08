@@ -2,19 +2,19 @@
 //!
 //! Standalone per-widget artifact — see `rust/README.md`. The shader
 //! works in RAW PIXELS (the original was a fixed 28px-tall canvas):
-//! `res` must be the canvas's actual CSS size, and the canvas should
-//! match the design size — pixel math does NOT scale.
+//! `resolution_css` must be the canvas's actual CSS size, and the
+//! canvas should match the design size — pixel math does NOT scale.
 //!
 //! # Uniform layout (f32s = 12 — mirrors
 //! `GPU_WIDGET_UNIFORM_F32S[SWITCH_SLIDER]` and the WGSL struct)
 //!
-//!   [0,1]  res      canvas CSS px (track: 14px tall, radius 14)
-//!   [2]    time     seconds — wave/streak animation
-//!   [3]    progress 0..1 off→on (JS eases; shader lerps)
-//!   [4]    knob_x   knob center X in px (JS owns the spring)
-//!   [5]    context  0=stats 1=grid 2=motion — picks color+pattern
-//!   [6,7]  pad      16B alignment pad
-//!   [8..11] rect    (0,0,w,h) on the dedicated canvas
+//!   [0,1]  resolution_css canvas CSS px (track: 14px tall, radius 14)
+//!   [2]    time_seconds   seconds — wave/streak animation
+//!   [3]    switch_progress 0..1 off→on (JS eases; shader lerps)
+//!   [4]    knob_center_x  knob center X in px (JS owns the spring)
+//!   [5]    context_id     0=stats 1=grid 2=motion — picks color+pattern
+//!   [6,7]  reserved       16B alignment pad
+//!   [8..11] clip_rect     (0,0,w,h) on the dedicated canvas
 //!
 //! # Frame cost
 //!
@@ -24,7 +24,8 @@ use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
 use web_sys::{GpuDevice, HtmlCanvasElement};
 
-/// WGSL — pill track + knob + per-context waveform.
+/// WGSL — pill track + knob + per-context waveform fragment chunk
+/// (shared dist_to_segment + vs_main arrive via the gpu-mini library).
 const WGSL: &str = include_str!("switch_slider.wgsl");
 
 /// Uniform f32 count — see module doc.
@@ -32,17 +33,17 @@ const UNIFORM_F32S: usize = 12;
 
 /// Toggle state repacked into the uniform block per frame.
 struct State {
-    /// Canvas CSS px — the `res` field (design-unit pixel domain).
-    css: [f32; 2],
-    /// Canvas DEVICE px — the `rect.zw` divisor mapping `frag`
-    /// (device px) into widget uv 0..1. Written by `resize`.
-    dev: [f32; 2],
+    /// Canvas CSS px — the `resolution_css` field (pixel domain).
+    css_size: [f32; 2],
+    /// Canvas DEVICE px — the `clip_rect.zw` divisor mapping
+    /// `pixel_coord` (device px) into widget uv 0..1. Written by `resize`.
+    device_size: [f32; 2],
     /// 0..1 off→on (JS eases before passing).
-    progress: f32,
+    switch_progress: f32,
     /// Knob center X in px — JS owns the spring curve.
-    knob_x: f32,
+    knob_center_x: f32,
     /// Track personality: 0 stats / 1 grid / 2 motion.
-    context: f32,
+    context_id: f32,
 }
 
 /// Public wasm surface — one toggle canvas per instance.
@@ -53,7 +54,7 @@ pub struct SwitchSlider {
     /// Scalar state repacked per frame.
     state: RefCell<State>,
     /// Accumulated seconds — absorbs rAF jitter.
-    clock: Cell<f32>,
+    clock_seconds: Cell<f32>,
 }
 
 #[wasm_bindgen]
@@ -61,16 +62,19 @@ impl SwitchSlider {
     /// `SwitchSlider::new` — un-initialized widget; `init` must follow.
     #[wasm_bindgen(constructor)]
     pub fn new() -> SwitchSlider {
+        // Pre-init state: no GPU yet; off position (progress 0, knob
+        // at the 14px rest spot), stats context — `set_state` pushes
+        // the real values before the first frame.
         SwitchSlider {
             gpu: RefCell::new(None),
             state: RefCell::new(State {
-                css: [1.0, 1.0],
-                dev: [1.0, 1.0],
-                progress: 0.0,
-                knob_x: 14.0,
-                context: 0.0,
+                css_size: [1.0, 1.0],
+                device_size: [1.0, 1.0],
+                switch_progress: 0.0,
+                knob_center_x: 14.0,
+                context_id: 0.0,
             }),
-            clock: Cell::new(0.0),
+            clock_seconds: Cell::new(0.0),
         }
     }
 
@@ -92,39 +96,49 @@ impl SwitchSlider {
             return Err(JsValue::from_str("init: gpu slot poisoned"));
         };
 
+        // Publish the live scaffold — `frame` may now borrow it.
         *slot = Some(built);
+
         Ok(())
     }
 
     /// `resize` — canvas-bitmap change → surface re-configure + the
-    /// DEVICE-pixel size that becomes `rect.zw` (the frag→uv divisor;
-    /// `frag` arrives in device px, so the divisor must too).
+    /// DEVICE-pixel size that becomes `clip_rect.zw` (the frag→uv
+    /// divisor; `pixel_coord` arrives in device px, so the divisor
+    /// must too).
     ///
-    /// @param w Device-pixel width (element CSS px × DPR).
-    /// @param h Device-pixel height.
-    pub fn resize(&self, w: u32, h: u32) {
-        if let Ok(mut s) = self.state.try_borrow_mut() {
-            s.dev = [(w.max(1)) as f32, (h.max(1)) as f32];
+    /// @param width Device-pixel width (element CSS px × DPR).
+    /// @param height Device-pixel height.
+    pub fn resize(&self, width: u32, height: u32) {
+        // Store the device-px size (clip_rect.zw); clamped ≥1 so the
+        // frag→uv divisor never sees a zero-sized canvas.
+        if let Ok(mut state) = self.state.try_borrow_mut() {
+            state.device_size = [(width.max(1)) as f32, (height.max(1)) as f32];
         }
 
+        // Bail while init is in flight — the surface configures
+        // itself when it arrives.
         let Ok(gpu) = self.gpu.try_borrow() else {
             return;
         };
 
-        if let Some(w) = gpu.as_ref() {
-            gpu_mini::resize(&w.surface);
+        // Re-configure the live surface to match the new bitmap.
+        if let Some(widget) = gpu.as_ref() {
+            gpu_mini::resize(&widget.surface);
         }
     }
 
-    /// `set_size` — the canvas's CSS-pixel size (res + rect). NOTE: the
-    /// shader's pixel-space math assumes the design height (~28px) —
-    /// mount the canvas at the design size.
+    /// `set_size` — the canvas's CSS-pixel size (resolution_css +
+    /// clip_rect). NOTE: the shader's pixel-space math assumes the
+    /// design height (~28px) — mount the canvas at the design size.
     ///
-    /// @param w Canvas width in CSS pixels.
-    /// @param h Canvas height in CSS pixels.
-    pub fn set_size(&self, w: f32, h: f32) {
-        if let Ok(mut s) = self.state.try_borrow_mut() {
-            s.css = [w.max(1.0), h.max(1.0)];
+    /// @param width Canvas width in CSS pixels.
+    /// @param height Canvas height in CSS pixels.
+    pub fn set_size(&self, width: f32, height: f32) {
+        // CSS-px pair — ≥1 clamp; the shader's pixel math treats it
+        // as the design-unit domain (mount at design size, see doc).
+        if let Ok(mut state) = self.state.try_borrow_mut() {
+            state.css_size = [width.max(1.0), height.max(1.0)];
         }
     }
 
@@ -132,58 +146,73 @@ impl SwitchSlider {
     /// and the context personality (0 stats / 1 grid / 2 motion —
     /// mirrored by `GPU_SWITCH_CONTEXTS` on the JS side).
     ///
-    /// @param progress 0..1 eased on-ness.
-    /// @param knob_x Knob center X in px.
-    /// @param context Track personality discriminant.
-    pub fn set_state(&self, progress: f32, knob_x: f32, context: f32) {
-        let Ok(mut s) = self.state.try_borrow_mut() else {
+    /// @param switch_progress 0..1 eased on-ness.
+    /// @param knob_center_x Knob center X in px.
+    /// @param context_id Track personality discriminant.
+    pub fn set_state(&self, switch_progress: f32, knob_center_x: f32, context_id: f32) {
+        let Ok(mut state) = self.state.try_borrow_mut() else {
             return;
         };
 
-        s.progress = progress.clamp(0.0, 1.0);
-        s.knob_x = knob_x;
-        s.context = context;
+        // Clamp the eased on-ness into 0..1.
+        state.switch_progress = switch_progress.clamp(0.0, 1.0);
+
+        // Knob position — verbatim; JS owns the spring math.
+        state.knob_center_x = knob_center_x;
+
+        // Personality discriminant — verbatim (0/1/2 by contract).
+        state.context_id = context_id;
     }
 
     /// `frame` — one animation tick: pack, write, draw.
     ///
-    /// @param dt Seconds since the previous call.
-    pub fn frame(&self, dt: f32) {
+    /// @param delta_seconds Seconds since the previous call.
+    pub fn frame(&self, delta_seconds: f32) {
+        // Bail while init is in flight — a contended slot skips a tick.
         let Ok(gpu) = self.gpu.try_borrow() else {
             return;
         };
 
-        let Some(w) = gpu.as_ref() else {
+        // Still `None` → init hasn't resolved; nothing to draw yet.
+        let Some(widget) = gpu.as_ref() else {
             return;
         };
 
-        self.clock.set(self.clock.get() + dt);
+        // Advance the wave/streak clock — summing dt absorbs rAF jitter.
+        self.clock_seconds
+            .set(self.clock_seconds.get() + delta_seconds);
 
-        let Ok(s) = self.state.try_borrow() else {
+        // Snapshot the scalar state under the guard…
+        let Ok(state) = self.state.try_borrow() else {
             return;
         };
 
-        // [0,1] res (CSS px) [2] time [3] progress [4] knob_x [5] context
-        // [6,7] pad [8..11] rect = (0,0,dev) — DEVICE px, frag→uv divisor
+        // [0,1] resolution_css [2] time_seconds [3] switch_progress
+        // [4] knob_center_x [5] context_id [6,7] reserved
+        // [8..11] clip_rect = (0,0,device_size) — DEVICE px divisor
         let uniforms: [f32; UNIFORM_F32S] = [
-            s.css[0],
-            s.css[1],
-            self.clock.get(),
-            s.progress,
-            s.knob_x,
-            s.context,
+            state.css_size[0],
+            state.css_size[1],
+            self.clock_seconds.get(),
+            state.switch_progress,
+            state.knob_center_x,
+            state.context_id,
             0.0,
             0.0,
             0.0,
             0.0,
-            s.dev[0],
-            s.dev[1],
+            state.device_size[0],
+            state.device_size[1],
         ];
 
-        drop(s);
+        // Release the state borrow BEFORE the GPU calls — no RefCell
+        // guard may be held across the JS-boundary work.
+        drop(state);
 
-        if !gpu_mini::widget_frame(w, &uniforms) {
-            gpu_mini::resize(&w.surface);
+        // Write + draw; a stale/lost surface re-configures itself so
+        // the next frame recovers cleanly.
+        if !gpu_mini::widget_frame(widget, &uniforms) {
+            gpu_mini::resize(&widget.surface);
         }
     }
 }
@@ -195,8 +224,8 @@ impl SwitchSlider {
 /// shared device; leaking the handles is safe and un-panickable.
 impl Drop for SwitchSlider {
     fn drop(&mut self) {
-        if let Some(g) = self.gpu.get_mut().take() {
-            std::mem::forget(g);
+        if let Some(gpu_state) = self.gpu.get_mut().take() {
+            std::mem::forget(gpu_state);
         }
     }
 }

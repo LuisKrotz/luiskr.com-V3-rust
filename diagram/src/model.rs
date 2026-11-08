@@ -29,9 +29,15 @@ impl Theme {
     /// neutral value (the bridge always sends all keys — the fallbacks
     /// exist so a hand-rolled caller still gets a readable diagram).
     pub fn from_json(json: &str) -> Theme {
+        // Malformed/absent JSON → Null value; every lookup then hits
+        // its fallback so a broken bridge still gets a diagram.
         let v: serde_json::Value = serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
 
+        // String lookup with fallback — `currentColor`/`transparent`
+        // defaults keep strokes visible against any page color.
         let s = |k: &str, d: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or(d).to_string();
+
+        // Number lookup with fallback — only fontSize is numeric.
         let n = |k: &str, d: f32| v.get(k).and_then(|x| x.as_f64()).unwrap_or(d as f64) as f32;
 
         Theme {
@@ -132,6 +138,9 @@ pub struct Group {
 /// line — the corpus writes multi-line labels with `<br/>` inside
 /// `["…"]` / `{"…"}` / `participant as` text.
 pub fn label_lines(raw: &str) -> Vec<String> {
+    // Normalize the two mermaid spelling variants to `<br/>`, split,
+    // trim, drop empties — the corpus mixes `<br>` and `<br />` and
+    // stray whitespace creeps in around the tag.
     raw.replace("<br />", "<br/>")
         .replace("<br>", "<br/>")
         .split("<br/>")
@@ -143,6 +152,8 @@ pub fn label_lines(raw: &str) -> Vec<String> {
 /// Escapes text for XML content — SVG is XML; `&<>"'` must not pass
 /// through raw or a label containing them produces malformed markup.
 pub fn esc(s: &str) -> String {
+    // `&` first — escaping it last would double-escape the entities
+    // the other replacements just produced.
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

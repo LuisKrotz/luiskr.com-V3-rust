@@ -13,57 +13,54 @@
 // Ambient is a flat 8% floor — enough to keep unlit faces readable in
 // the dark-space scenes without a second light source or IBL probe.
 //
-// Uniform layout: identical to shader_basic.wgsl (see that file's doc
-// for the byte map). light_* fields are populated here for real.
+// Uniform layout: frame_uniform.wgsl (the shared prelude — see that
+// file for the byte map). light_* fields are populated here for real;
+// material_params = [0]=unused, [1]=roughness, [2]=metalness.
 
-struct Frame {
-    view_proj : mat4x4<f32>,
-    cam_pos   : vec3<f32>,
-    time      : f32,
-    _pad0     : vec4<f32>,
-    light_pos : vec3<f32>,
-    _pad1     : f32,
-    light_rgb : vec3<f32>,
-    _pad2     : f32,
-    light_int : f32,
-    _pad3     : vec3<f32>,
-    canvas    : vec4<f32>,
-    model     : mat4x4<f32>,
-    mat_color : vec4<f32>,
-    mat_emit  : vec4<f32>,
-    mat_params: vec4<f32>,   // [0]=unused, [1]=roughness, [2]=metalness
-    mat_flags : vec4<f32>,
-};
+/// Ambient floor — keeps unlit faces readable without a second light
+/// source or IBL probe.
+const AMBIENT_FLOOR = 0.08;
 
-@group(0) @binding(0) var<uniform> frame : Frame;
-@group(1) @binding(0) var tex : texture_2d<f32>;
-@group(1) @binding(1) var smp : sampler;
+/// Roughness → Blinn-Phong exponent range: roughness 1 → ~2 (broad,
+/// matte), 0 → ~130 (tight glint).
+const SHININESS_RANGE = 128.0;
+const SHININESS_MIN = 2.0;
 
 struct VertexIn {
-    @location(0) pos : vec3<f32>,
-    @location(1) nrm : vec3<f32>,
-    @location(2) uv  : vec2<f32>,
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) tex_uv: vec2<f32>,
 };
 
 struct VertexOut {
-    @builtin(position) clip  : vec4<f32>,
-    @location(0) uv          : vec2<f32>,
-    @location(1) nrm         : vec3<f32>,
-    @location(2) world       : vec3<f32>,
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) tex_uv: vec2<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) world_pos: vec3<f32>,
 };
 
 /// `vs_main` — same matrix chain as basic plus a world-pos varying:
 /// the fragment stage needs it for the light vector L.
 @vertex
-fn vs_main(v : VertexIn) -> VertexOut {
-    var out : VertexOut;
+fn vs_main(vert: VertexIn) -> VertexOut {
+    var out: VertexOut;
 
-    let world = frame.model * vec4<f32>(v.pos, 1.0);
+    // Object → world position (w=1 — a point, translation applies).
+    let world_pos = frame_uniforms.model * vec4<f32>(vert.position, 1.0);
 
-    out.clip  = frame.view_proj * world;
-    out.uv    = v.uv;
-    out.nrm   = normalize((frame.model * vec4<f32>(v.nrm, 0.0)).xyz);
-    out.world = world.xyz;
+    // world → clip through the camera's proj·view.
+    out.clip_position = frame_uniforms.view_proj * world_pos;
+
+    // uv passes through for the fragment texture sample.
+    out.tex_uv = vert.tex_uv;
+
+    // Normal → world (w=0 — a direction, translation skipped),
+    // renormalized against scale distortion.
+    out.normal = normalize((frame_uniforms.model * vec4<f32>(vert.normal, 0.0)).xyz);
+
+    // World position is a real varying here — the fragment builds
+    // the light/view vectors from it.
+    out.world_pos = world_pos.xyz;
 
     return out;
 }
@@ -72,23 +69,40 @@ fn vs_main(v : VertexIn) -> VertexOut {
 /// math is normalized first (interpolation denormalizes normals —
 /// the classic per-fragment shading bug when skipped).
 @fragment
-fn fs_main(v : VertexOut) -> @location(0) vec4<f32> {
-    let texel   = textureSample(tex, smp, v.uv);
-    let base    = texel * frame.mat_color;
-    let n       = normalize(v.nrm);
-    let l       = normalize(frame.light_pos - v.world);
-    let viewdir = normalize(frame.cam_pos - v.world);
-    let h       = normalize(l + viewdir);
+fn fs_main(frag: VertexOut) -> @location(0) vec4<f32> {
+    // Texel × base tint — the diffuse albedo term.
+    let texel = textureSample(material_tex, material_sampler, frag.tex_uv);
 
-    let diff = max(dot(n, l), 0.0);
-    let shin = (1.0 - frame.mat_params.y) * 128.0 + 2.0;
-    let spec = pow(max(dot(n, h), 0.0), shin);
+    let albedo = texel * frame_uniforms.mat_color;
 
-    // Metalness lerps specular tint: white (dielectric) → base (metal).
-    let spec_tint = mix(vec3<f32>(1.0), base.rgb, frame.mat_params.z);
+    // Interpolated normal renormalized (interpolation denormalizes).
+    let surface_normal = normalize(frag.normal);
 
-    let lit = base.rgb * (0.08 + diff * frame.light_int * frame.light_rgb)
-            + spec_tint * spec * frame.light_int;
+    // L — fragment → light, normalized.
+    let light_dir = normalize(frame_uniforms.light_pos - frag.world_pos);
 
-    return vec4<f32>(lit + frame.mat_emit.rgb, base.a);
+    // V — fragment → camera, normalized.
+    let view_dir = normalize(frame_uniforms.camera_pos - frag.world_pos);
+
+    // H — Blinn half-vector (cheaper than Phong's reflect).
+    let half_dir = normalize(light_dir + view_dir);
+
+    // Lambert diffuse — clamped at 0 (back faces get no direct light).
+    let diffuse_term = max(dot(surface_normal, light_dir), 0.0);
+
+    // Roughness → specular exponent (see header map).
+    let specular_exponent = (1.0 - frame_uniforms.mat_params.y) * SHININESS_RANGE + SHININESS_MIN;
+
+    // Blinn specular lobe.
+    let specular_lobe = pow(max(dot(surface_normal, half_dir), 0.0), specular_exponent);
+
+    // Metalness lerps specular tint: white (dielectric) → albedo (metal).
+    let specular_tint = mix(vec3<f32>(1.0), albedo.rgb, frame_uniforms.mat_params.z);
+
+    // ambient floor + colored diffuse·intensity + tinted specular.
+    let lit_rgb = albedo.rgb * (AMBIENT_FLOOR + diffuse_term * frame_uniforms.light_int * frame_uniforms.light_rgb)
+        + specular_tint * specular_lobe * frame_uniforms.light_int;
+
+    // Emissive adds after lighting; alpha comes straight from albedo.
+    return vec4<f32>(lit_rgb + frame_uniforms.mat_emit.rgb, albedo.a);
 }

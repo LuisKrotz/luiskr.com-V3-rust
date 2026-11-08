@@ -77,8 +77,14 @@ struct Autolink {
 /// @param text One text run (a `Event::Text` payload).
 /// @returns The span list — empty when the run holds no URL.
 fn scan_autolinks(text: &str) -> Vec<Autolink> {
+    // Byte-level walk — every matcher below is ASCII, so raw bytes
+    // are safe and avoid char-boundary overhead.
     let bytes = text.as_bytes();
+
+    // Ordered, non-overlapping link spans found so far.
     let mut spans = Vec::new();
+
+    // Scan cursor — advances past each consumed span (never rescans).
     let mut i = 0;
 
     while i < bytes.len() {
@@ -95,6 +101,8 @@ fn scan_autolinks(text: &str) -> Vec<Autolink> {
             None
         };
 
+        // Boundary check: run start, or the previous char is non-word —
+        // `xhttps://` must not link `https://` off the larger word.
         let boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
 
         match head {
@@ -137,6 +145,7 @@ fn scan_autolinks(text: &str) -> Vec<Autolink> {
                     end -= 1;
                 }
 
+                // Anything left after the trims is a real link span.
                 if end > i {
                     spans.push(Autolink {
                         url_start: i,
@@ -149,6 +158,8 @@ fn scan_autolinks(text: &str) -> Vec<Autolink> {
                 // same `i` and loop forever.
                 i = end.max(i + 1);
             }
+            // No head match (or head without a boundary) — step one
+            // byte and keep scanning.
             _ => {
                 i += 1;
             }
@@ -168,11 +179,17 @@ fn scan_autolinks(text: &str) -> Vec<Autolink> {
 /// `www.` links prepend `http://` on the href only (the visible text
 /// keeps the `www.` — exactly marked's `href` behavior).
 fn autolink_events<'a>(events: impl Iterator<Item = Event<'a>>) -> Vec<Event<'a>> {
+    // The rewritten event stream.
     let mut out = Vec::new();
+
+    // Context latches — track whether the cursor sits inside a link
+    // or code span so their text stays literal (no autolinking).
     let mut in_link = false;
     let mut in_code = false;
 
     for ev in events {
+        // Maintain the context latches on every Start/End tag before
+        // the text handling below reads them.
         match &ev {
             Event::Start(Tag::Link { .. }) => in_link = true,
             Event::Start(Tag::CodeBlock(_)) => in_code = true,
@@ -181,18 +198,24 @@ fn autolink_events<'a>(events: impl Iterator<Item = Event<'a>>) -> Vec<Event<'a>
             _ => {}
         }
 
+        // Non-text events pass through untouched — only Text runs can
+        // carry a bare URL.
         let Event::Text(text) = ev else {
             out.push(ev);
             continue;
         };
 
+        // Inside a link or code context the run stays literal — pass
+        // it through unchanged.
         if in_link || in_code {
             out.push(Event::Text(text));
             continue;
         }
 
+        // Scan for URL spans…
         let spans = scan_autolinks(&text);
 
+        // …none found → the run stays a single Text event.
         if spans.is_empty() {
             out.push(Event::Text(text));
             continue;
@@ -203,12 +226,16 @@ fn autolink_events<'a>(events: impl Iterator<Item = Event<'a>>) -> Vec<Event<'a>
         let mut cursor = 0;
 
         for span in spans {
+            // Emit the literal gap before this span (skipped when the
+            // span starts right at the cursor).
             if span.url_start > cursor {
                 out.push(Event::Text(CowStr::Boxed(
                     text[cursor..span.url_start].into(),
                 )));
             }
 
+            // Slice the URL; `www.` spans get `http://` on the href
+            // only — the visible text keeps `www.` (marked parity).
             let url = &text[span.url_start..span.url_end];
             let href = if url.starts_with("www.") {
                 CowStr::Boxed(format!("http://{url}").into_boxed_str())
@@ -216,18 +243,25 @@ fn autolink_events<'a>(events: impl Iterator<Item = Event<'a>>) -> Vec<Event<'a>
                 CowStr::Boxed(url.to_string().into_boxed_str())
             };
 
+            // Emit Link(Start) → Text(url) → End — the triple pulldown
+            // itself produces for a real link, so push_html renders
+            // the identical `<a href="u">u</a>` shape.
             out.push(Event::Start(Tag::Link {
                 link_type: LinkType::Autolink,
                 dest_url: href,
                 title: "".into(),
                 id: "".into(),
             }));
+
             out.push(Event::Text(CowStr::Boxed(url.to_string().into_boxed_str())));
+
             out.push(Event::End(TagEnd::Link));
 
+            // Advance past the consumed span.
             cursor = span.url_end;
         }
 
+        // Emit the trailing literal after the last span, if any.
         if cursor < text.len() {
             out.push(Event::Text(CowStr::Boxed(text[cursor..].into())));
         }
@@ -262,11 +296,16 @@ fn autolink_events<'a>(events: impl Iterator<Item = Event<'a>>) -> Vec<Event<'a>
 /// @returns The rendered HTML string.
 #[wasm_bindgen]
 pub fn markdown_to_html(source: &str) -> String {
+    // Enable exactly the three GFM extensions marked's `gfm` bundle
+    // produced — every other option stays off (see doc: parity means
+    // no footnotes/smart-punct/math/etc.).
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
 
+    // Build the pull parser, then wrap it in the autolink transform —
+    // pulldown emits the events, the fold rewrites bare-URL text runs.
     let parser = autolink_events(Parser::new_ext(source, opts));
 
     // Preallocate ~1.5× source — HTML output for prose documents runs
@@ -274,7 +313,10 @@ pub fn markdown_to_html(source: &str) -> String {
     // a mid-write reallocation, undershooting just costs one.
     let mut out = String::with_capacity(source.len() + source.len() / 2);
 
+    // Render the (possibly rewritten) event stream into the
+    // preallocated HTML buffer…
     html::push_html(&mut out, parser.into_iter());
 
+    // …and hand the whole document back to the JS pipeline.
     out
 }

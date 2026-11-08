@@ -45,15 +45,15 @@ struct Gpu {
     /// The textured-quad pipeline (6 verts, no vertex buffer).
     pipeline: web_sys::GpuRenderPipeline,
     /// Uniform block — the 12-f32 layout above.
-    ubuf: web_sys::GpuBuffer,
+    uniform_buffer: web_sys::GpuBuffer,
     /// Shared linear sampler.
     sampler: web_sys::GpuSampler,
     /// Current media texture — swapped by uploads.
-    tex: RefCell<Option<web_sys::GpuTexture>>,
+    media_tex: RefCell<Option<web_sys::GpuTexture>>,
     /// Bind-group layout — kept so uploads can rebuild `bind`.
     layout: web_sys::GpuBindGroupLayout,
     /// Bound resources — rebuilt on every texture swap.
-    bind: RefCell<Option<web_sys::GpuBindGroup>>,
+    bind_group: RefCell<Option<web_sys::GpuBindGroup>>,
 }
 
 /// Media state repacked into the uniform block per frame.
@@ -64,7 +64,7 @@ struct State {
     /// receives and what the DOM geometry API speaks, so the whole
     /// pipeline stays in CSS units with zero DPR math. (Only frag-
     /// driven shaders need device px — this one never reads `frag`.)
-    css: [f32; 2],
+    css_size: [f32; 2],
     /// Cover-fit crop window [u, v, du, dv] — JS computes aspect math
     /// so the shader stays ignorant of source/dest aspect ratios.
     uv_rect: [f32; 4],
@@ -84,10 +84,12 @@ impl Media {
     /// `Media::new` — un-initialized widget; `init` must follow.
     #[wasm_bindgen(constructor)]
     pub fn new() -> Media {
+        // Pre-init state: no GPU yet; 1.0px canvas + identity crop
+        // window (whole texture) keep the projection degenerate-safe.
         Media {
             gpu: RefCell::new(None),
             state: RefCell::new(State {
-                css: [1.0, 1.0],
+                css_size: [1.0, 1.0],
                 uv_rect: [0.0, 0.0, 1.0, 1.0],
             }),
         }
@@ -100,9 +102,11 @@ impl Media {
     /// @param device The shared GPUDevice (one per page, from the JS bridge).
     /// @returns Ok on a live surface, Err(JsValue) on failure.
     pub fn init(&self, canvas: HtmlCanvasElement, device: GpuDevice) -> Result<(), JsValue> {
+        // Step 1 — wrap the canvas in a configured surface.
         let surface = gpu_mini::init_surface(&canvas, &device)?;
 
-        // binding 0 uniform · 1 texture · 2 sampler — the WGSL contract.
+        // Step 2 — bind-group layout: binding 0 uniform · 1 texture ·
+        // 2 sampler — the WGSL contract.
         let layout = gpu_mini::new_layout(
             &surface.device,
             &[
@@ -112,19 +116,27 @@ impl Media {
             ],
         )?;
 
+        // Step 3 — compile the pipeline (the media shader draws a
+        // 6-vertex quad — see draw_media for the counted pass). The
+        // shader keeps its own vs_main, so it takes the helpers
+        // prelude (quad_corner), not the fullscreen triangle source.
+        let source = gpu_mini::wgsl::helpers_source(WGSL);
         let pipeline = gpu_mini::fullscreen_pipeline(
             &surface.device,
             surface.format,
-            WGSL,
+            &source,
             &[layout.clone()],
         )?;
 
-        let ubuf = gpu_mini::new_buffer(
+        // Step 4 — uniform buffer; 256 B over the 48 B block keeps
+        // headroom for layout growth without reallocating.
+        let uniform_buffer = gpu_mini::new_buffer(
             &surface.device,
             256,
             gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST,
         )?;
 
+        // Step 5 — the linear sampler the media texture reads.
         let sampler = gpu_mini::linear_sampler(&surface.device);
 
         // try_borrow everywhere: a JS exception crossing a wasm frame
@@ -133,14 +145,16 @@ impl Media {
         let Ok(mut slot) = self.gpu.try_borrow_mut() else {
             return Err(JsValue::from_str("init: gpu slot poisoned"));
         };
+        // Publish the scaffold — tex/bind stay `None` until the first
+        // upload lands; `frame` skips draws until then.
         *slot = Some(Gpu {
             surface,
             pipeline,
-            ubuf,
+            uniform_buffer,
             sampler,
-            tex: RefCell::new(None),
+            media_tex: RefCell::new(None),
             layout,
-            bind: RefCell::new(None),
+            bind_group: RefCell::new(None),
         });
 
         Ok(())
@@ -149,18 +163,22 @@ impl Media {
     /// `rebind` — rebuild the bind group around the current texture.
     /// Bind groups are immutable, so every texture swap rebinds.
     fn rebind(&self) {
+        // Bail while init is in flight.
         let Ok(gpu) = self.gpu.try_borrow() else {
             return;
         };
 
-        let Some(g) = gpu.as_ref() else {
+        // Still `None` → init hasn't resolved.
+        let Some(gpu_state) = gpu.as_ref() else {
             return;
         };
 
-        let Ok(tex) = g.tex.try_borrow() else {
+        // Borrow the current texture slot…
+        let Ok(tex) = gpu_state.media_tex.try_borrow() else {
             return;
         };
 
+        // …`None` → no upload has landed yet; nothing to bind.
         let Some(tex) = tex.as_ref() else {
             return;
         };
@@ -168,24 +186,28 @@ impl Media {
         // A device fault skips the rebind — the previous bind group
         // keeps drawing rather than a wasm panic poisoning the frame
         // callbacks.
-        let Ok(v) = gpu_mini::view(tex) else {
+        let Ok(view) = gpu_mini::view(tex) else {
             return;
         };
 
-        let bind = gpu_mini::new_bind_group(
-            &g.surface.device,
-            &g.layout,
+        // Rebuild the group: same uniform_buffer + sampler, fresh
+        // texture view.
+        let bind_group = gpu_mini::new_bind_group(
+            &gpu_state.surface.device,
+            &gpu_state.layout,
             &[
-                gpu_mini::bind_buffer_entry(0, &g.ubuf),
-                gpu_mini::bind_view_entry(1, &v),
-                gpu_mini::bind_sampler_entry(2, &g.sampler),
+                gpu_mini::bind_buffer_entry(0, &gpu_state.uniform_buffer),
+                gpu_mini::bind_view_entry(1, &view),
+                gpu_mini::bind_sampler_entry(2, &gpu_state.sampler),
             ],
         );
 
-        let Ok(mut b) = g.bind.try_borrow_mut() else {
+        // Publish — `frame` picks up the new texture next tick.
+        let Ok(mut bind_slot) = gpu_state.bind_group.try_borrow_mut() else {
             return;
         };
-        *b = Some(bind);
+
+        *bind_slot = Some(bind_group);
     }
 
     /// `upload_bitmap` — paint a decoded `ImageBitmap` (JS did the
@@ -193,26 +215,37 @@ impl Media {
     /// the fastest possible path and zero wasm-side decode code.
     ///
     /// @param bitmap The decoded image.
-    /// @param w Bitmap width px.
-    /// @param h Bitmap height px.
-    pub fn upload_bitmap(&self, bitmap: ImageBitmap, w: u32, h: u32) {
+    /// @param width Bitmap width px.
+    /// @param height Bitmap height px.
+    pub fn upload_bitmap(&self, bitmap: ImageBitmap, width: u32, height: u32) {
+        // Bail while init is in flight.
         let Ok(gpu) = self.gpu.try_borrow() else {
             return;
         };
 
-        let Some(g) = gpu.as_ref() else {
+        // Still `None` → init hasn't resolved.
+        let Some(gpu_state) = gpu.as_ref() else {
             return;
         };
 
-        let Ok(tex) = gpu_mini::bitmap_texture(&g.surface.device, &g.surface.queue, &bitmap, w, h)
+        // GPU→GPU copy — a device fault keeps the previous texture
+        // rather than panicking inside the upload call.
+        let Ok(tex) = gpu_mini::bitmap_texture(&gpu_state.surface.device, &gpu_state.surface.queue, &bitmap, width, height)
         else {
             return;
         };
 
-        if let Ok(mut t) = g.tex.try_borrow_mut() {
-            *t = Some(tex);
+        // Swap the texture slot — a contended borrow skips the swap
+        // and the rebind below just rebinds the stale texture (still
+        // drawable).
+        if let Ok(mut tex_slot) = gpu_state.media_tex.try_borrow_mut() {
+            *tex_slot = Some(tex);
         }
+
+        // Release the gpu guard BEFORE rebind — it borrows the same
+        // slot and would deadlock on a reentrant borrow otherwise.
         drop(gpu);
+
         self.rebind();
     }
 
@@ -221,37 +254,50 @@ impl Media {
     /// requestVideoFrameCallback, NOT per rAF.
     ///
     /// @param frame The decoded frame.
-    /// @param w Frame width px.
-    /// @param h Frame height px.
-    pub fn push_frame(&self, frame: VideoFrame, w: u32, h: u32) {
+    /// @param width Frame width px.
+    /// @param height Frame height px.
+    pub fn push_frame(&self, frame: VideoFrame, width: u32, height: u32) {
+        // Bail while init is in flight.
         let Ok(gpu) = self.gpu.try_borrow() else {
             return;
         };
 
-        let Some(g) = gpu.as_ref() else {
+        // Still `None` → init hasn't resolved.
+        let Some(gpu_state) = gpu.as_ref() else {
             return;
         };
 
         // VideoFrame → texture: same copyExternalImageToTexture path
         // (the source-info constructor takes VideoFrame directly).
-        let src = web_sys::GpuCopyExternalImageSourceInfo::new_with_video_frame(&frame);
+        let source_info = web_sys::GpuCopyExternalImageSourceInfo::new_with_video_frame(&frame);
 
-        let Ok(tex) = gpu_mini::new_texture(&g.surface.device, w.max(1), h.max(1)) else {
+        // A fresh destination texture per frame — ≥1 clamps guard a
+        // degenerate 0-size frame from producing an invalid object.
+        let Ok(tex) = gpu_mini::new_texture(&gpu_state.surface.device, width.max(1), height.max(1)) else {
             return;
         };
-        let dest = web_sys::GpuCopyExternalImageDestInfo::new(&tex);
-        let size = web_sys::GpuExtent3dDict::new(w.max(1));
-        size.set_height(h.max(1));
 
-        let _ = g
+        let dest_info = web_sys::GpuCopyExternalImageDestInfo::new(&tex);
+
+        let extent = web_sys::GpuExtent3dDict::new(width.max(1));
+        extent.set_height(height.max(1));
+
+        // The GPU→GPU copy — synchronous queue call; the new frame
+        // replaces the whole texture.
+        let _ = gpu_state
             .surface
             .queue
-            .copy_external_image_to_texture_with_gpu_extent_3d_dict(&src, &dest, &size);
+            .copy_external_image_to_texture_with_gpu_extent_3d_dict(&source_info, &dest_info, &extent);
 
-        if let Ok(mut t) = g.tex.try_borrow_mut() {
-            *t = Some(tex);
+        // Swap the texture slot (contended → skip, same as upload).
+        if let Ok(mut tex_slot) = gpu_state.media_tex.try_borrow_mut() {
+            *tex_slot = Some(tex);
         }
+
+        // Release the gpu guard BEFORE rebind — same reentrancy rule
+        // as upload_bitmap above.
         drop(gpu);
+
         self.rebind();
     }
 
@@ -259,25 +305,29 @@ impl Media {
     /// projection is pure CSS px (`rect`/`viewport` — see State doc),
     /// so no size state updates here.
     ///
-    /// @param _w Device-pixel width (element-side; unused — see doc).
-    /// @param _h Device-pixel height.
-    pub fn resize(&self, _w: u32, _h: u32) {
+    /// @param _width Device-pixel width (element-side; unused — see doc).
+    /// @param _height Device-pixel height.
+    pub fn resize(&self, _width: u32, _height: u32) {
+        // Bail while init is in flight — the surface configures
+        // itself when it arrives.
         let Ok(gpu) = self.gpu.try_borrow() else {
             return;
         };
 
-        if let Some(g) = gpu.as_ref() {
-            gpu_mini::resize(&g.surface);
+        // Re-configure the live surface to match the new bitmap.
+        if let Some(gpu_state) = gpu.as_ref() {
+            gpu_mini::resize(&gpu_state.surface);
         }
     }
 
     /// `set_size` — the canvas's CSS-pixel size (rect + viewport).
     ///
-    /// @param w Canvas width in CSS pixels.
-    /// @param h Canvas height in CSS pixels.
-    pub fn set_size(&self, w: f32, h: f32) {
-        if let Ok(mut s) = self.state.try_borrow_mut() {
-            s.css = [w.max(1.0), h.max(1.0)];
+    /// @param width Canvas width in CSS pixels.
+    /// @param height Canvas height in CSS pixels.
+    pub fn set_size(&self, width: f32, height: f32) {
+        // CSS-px pair — ≥1 clamp so the px→ndc divisors stay non-zero.
+        if let Ok(mut state) = self.state.try_borrow_mut() {
+            state.css_size = [width.max(1.0), height.max(1.0)];
         }
     }
 
@@ -285,13 +335,15 @@ impl Media {
     /// the texture maps onto the widget. JS computes the aspect math
     /// (single responsibility — the shader just samples it).
     ///
-    /// @param u Crop window left edge, 0..1.
-    /// @param v Crop window top edge, 0..1.
-    /// @param du Crop window width, 0..1.
-    /// @param dv Crop window height, 0..1.
-    pub fn set_uv_rect(&self, u: f32, v: f32, du: f32, dv: f32) {
-        if let Ok(mut s) = self.state.try_borrow_mut() {
-            s.uv_rect = [u, v, du, dv];
+    /// @param uv_left Crop window left edge, 0..1.
+    /// @param uv_top Crop window top edge, 0..1.
+    /// @param uv_width Crop window width, 0..1.
+    /// @param uv_height Crop window height, 0..1.
+    pub fn set_uv_rect(&self, uv_left: f32, uv_top: f32, uv_width: f32, uv_height: f32) {
+        // Store the crop window verbatim — JS already did the
+        // cover-fit aspect math.
+        if let Ok(mut state) = self.state.try_borrow_mut() {
+            state.uv_rect = [uv_left, uv_top, uv_width, uv_height];
         }
     }
 
@@ -299,108 +351,66 @@ impl Media {
     /// until an upload lands); the bridge calls this on resize/scroll
     /// or per rAF — drawing costs one 6-vertex call.
     ///
-    /// @param _dt Seconds since last call (unused — media is static
-    ///            between uploads; kept for API symmetry).
-    pub fn frame(&self, _dt: f32) {
+    /// @param _delta_seconds Seconds since last call (unused — media
+    ///            is static between uploads; kept for API symmetry).
+    pub fn frame(&self, _delta_seconds: f32) {
+        // Bail while init is in flight.
         let Ok(gpu) = self.gpu.try_borrow() else {
             return;
         };
 
-        let Some(g) = gpu.as_ref() else {
+        // Still `None` → init hasn't resolved.
+        let Some(gpu_state) = gpu.as_ref() else {
             return;
         };
 
-        let Ok(bind) = g.bind.try_borrow() else {
+        // Borrow the bind group — contended → skip the tick.
+        let Ok(bind_group) = gpu_state.bind_group.try_borrow() else {
             return;
         };
 
-        let Some(bind) = bind.as_ref() else {
+        // `None` → no upload yet; an unbound draw would be a
+        // validation error, so skip silently.
+        let Some(bound) = bind_group.as_ref() else {
             return;
         };
 
-        let Ok(s) = self.state.try_borrow() else {
+        // Snapshot the scalar state under the guard…
+        let Ok(state) = self.state.try_borrow() else {
             return;
         };
 
-        // [0..3] rect=(0,0,css) CSS px [4..7] uv_rect
-        // [8,9] viewport=css CSS px [10,11] pad — the px→ndc ratio is
-        // unit-agnostic; CSS px keeps the whole pipeline in DOM units.
+        // [0..3] rect_css=(0,0,css) CSS px [4..7] uv_rect
+        // [8,9] viewport_css CSS px [10,11] reserved — the px→ndc
+        // ratio is unit-agnostic; CSS px keeps the whole pipeline in
+        // DOM units.
         let uniforms: [f32; UNIFORM_F32S] = [
             0.0,
             0.0,
-            s.css[0],
-            s.css[1],
-            s.uv_rect[0],
-            s.uv_rect[1],
-            s.uv_rect[2],
-            s.uv_rect[3],
-            s.css[0],
-            s.css[1],
+            state.css_size[0],
+            state.css_size[1],
+            state.uv_rect[0],
+            state.uv_rect[1],
+            state.uv_rect[2],
+            state.uv_rect[3],
+            state.css_size[0],
+            state.css_size[1],
             0.0,
             0.0,
         ];
 
-        drop(s);
+        // Release the state borrow BEFORE the GPU calls — no RefCell
+        // guard may be held across the JS-boundary work.
+        drop(state);
 
-        gpu_mini::write_f32s(&g.surface.queue, &g.ubuf, &uniforms);
+        // Push the packed block to the GPU…
+        gpu_mini::write_f32s(&gpu_state.surface.queue, &gpu_state.uniform_buffer, &uniforms);
 
         // draw 6 verts — the quad is two triangles (the shared `draw`
-        // hardcodes 3; media needs its own pass call, so it goes
-        // through `draw_vertices` below).
-        if !draw_media(&g.surface, &g.pipeline, bind) {
-            gpu_mini::resize(&g.surface);
+        // hardcodes 3; `draw_n` is the counted variant: 6 verts × 1
+        // instance, same acquire→pass→submit shape).
+        if !gpu_mini::draw_n(&gpu_state.surface, &gpu_state.pipeline, bound, None, 6, 1) {
+            gpu_mini::resize(&gpu_state.surface);
         }
     }
-}
-
-/// `draw_media` — like `gpu_mini::draw` but 6 vertices (the shader's
-/// two-triangle unit quad). Kept local because only the media shader
-/// uses a 6-vertex topology.
-///
-/// @param surface The live surface.
-/// @param pipeline The media pipeline.
-/// @param bind Its bind group.
-/// @returns true when a frame was submitted.
-fn draw_media(
-    surface: &gpu_mini::Surface,
-    pipeline: &web_sys::GpuRenderPipeline,
-    bind: &web_sys::GpuBindGroup,
-) -> bool {
-    let tex = match surface.context.get_current_texture() {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-
-    let view = match tex.create_view() {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-
-    let clear = web_sys::GpuColorDict::new(0.0, 0.0, 0.0, 0.0);
-    let attach = web_sys::GpuRenderPassColorAttachment::new_with_gpu_texture_view(
-        web_sys::GpuLoadOp::Clear,
-        web_sys::GpuStoreOp::Store,
-        &view,
-    );
-    attach.set_clear_value_gpu_color_dict(&clear);
-
-    let attachments = [js_sys::JsNullable::wrap(attach)];
-    let pass_desc = web_sys::GpuRenderPassDescriptor::new(&attachments);
-
-    let encoder = surface
-        .device
-        .create_command_encoder_with_descriptor(&web_sys::GpuCommandEncoderDescriptor::new());
-
-    match encoder.begin_render_pass(&pass_desc) {
-        Ok(pass) => {
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, Some(bind));
-            pass.draw(6);
-            pass.end();
-        }
-        Err(_) => return false,
-    }
-
-    surface.queue.submit(&[encoder.finish()]);
-    true
 }

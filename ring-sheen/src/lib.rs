@@ -1,47 +1,41 @@
-//! ring-sheen — the tile border sheen ring (mosaic + related items).
+//! ring-sheen — the home-mosaic / related-item border rings with a
+//! drifting diagonal sheen.
 //!
-//! Standalone per-widget artifact — see `rust/README.md`. Replaces
-//! the masked-gradient `::before`/`::after` ring on
-//! `.home-mosaic-item` and `.related-item` (the `mosaic-border-sheen`
-//! / `related-border-sheen` keyframes) with ONE overlay canvas per
-//! container: per-tile rects stream down a storage sheet and the
-//! shader draws every ring as an instanced SDF quad — one draw call
-//! for the whole grid instead of 2 pseudo-element layers × N tiles,
-//! each a compositor layer of its own.
+//! Standalone per-widget artifact — see `rust/README.md`. Replaces the
+//! CSS masked-gradient ring + 9s `background-position` sweep with ONE
+//! overlay canvas per grid: per-tile rects stream down a storage
+//! sheet and the shader draws every ring as an instanced SDF — one
+//! draw call for the whole grid instead of N compositor layers.
 //!
 //! # What the shader reproduces (home-mosaic/_item.scss parity)
 //!
-//!   ring   — hairline band at the tile's rounded-rect edge
-//!            (`padding: var(--space-hairline)` mask-composite).
-//!   sheen  — a diagonal brightness band (the 120° gradient stops:
-//!            transparent 32% → border-item-hover 45% →
-//!            accent-contrast 50% → border-item-hover 55% →
-//!            transparent 68%), its position drifting along the
+//!   ring   — hairline band at each tile's rounded-rect edge.
+//!   sheen  — a narrow brightness band sliding along the 120°
 //!            diagonal on the 9s alternate loop.
 //!   breath — the ::before opacity cross-fade 0.15↔0.9, ease-in-out
 //!            alternate over 9s (the two-layer trick reduces to one
 //!            alpha term on GPU).
 //!
-//! # Tile-sheet layout (8 f32s per tile — storage `array<TileRec>`)
+//! # Tile-sheet layout (8 f32s per tile — storage `array<TileRecord>`)
 //!
-//!   [0..4)  rect    x, y, w, h — device px on the overlay canvas
-//!   [4]     radius  corner radius (device px — the tiles share
-//!                   --radius tokens, but per-tile keeps the sheet
-//!                   honest when variants diverge)
-//!   [5]     phase   per-tile phase offset 0..1 (0 in the CSS — all
-//!                   tiles pulse in unison; the slot exists so a
-//!                   staggered variant is one push away)
-//!   [6,7]   pad
+//!   [0..4)  rect_px      x, y, w, h — device px on the overlay canvas
+//!   [4]     corner_radius (device px — the tiles share --radius
+//!                        tokens, but per-tile keeps the sheet honest
+//!                        when variants diverge)
+//!   [5]     phase_offset per-tile phase offset 0..1 (0 in the CSS —
+//!                        all tiles pulse in unison; the slot exists
+//!                        so a staggered variant is one push away)
+//!   [6,7]   reserved
 //!
 //! # Uniform layout (f32s = 16 — mirrors
 //! `GPU_WIDGET_UNIFORM_F32S[RING_SHEEN]` and the WGSL struct)
 //!
-//!   [0,1]   res     canvas DEVICE px
-//!   [2]     time    seconds — the 9s sweep clock
-//!   [3]     hair    hairline half-width (device px)
-//!   [4..8]  edge    ring edge rgba (var(--border-item-hover))
-//!   [8..12] accent  sheen-core rgba (var(--color-accent-contrast))
-//!   [12..16] pad
+//!   [0,1]   resolution_dev canvas DEVICE px
+//!   [2]     time_seconds   seconds — the 18s round-trip sweep clock
+//!   [3]     hairline_half  hairline half-width (device px)
+//!   [4..8]  edge_rgba      ring edge rgba (var(--border-item-hover))
+//!   [8..12] accent_rgba    sheen-core rgba (var(--color-accent-contrast))
+//!   [12..16] reserved
 //!
 //! # Bindings
 //!
@@ -56,7 +50,8 @@ use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
 use web_sys::{gpu_buffer_usage, GpuDevice, HtmlCanvasElement};
 
-/// WGSL — instanced ring-sheen shader.
+/// WGSL — instanced ring-sheen shader; keeps its own vertex stage, so
+/// it composes with `wgsl::helpers_source` (SDF + quad + easing only).
 const WGSL: &str = include_str!("ring_sheen.wgsl");
 
 /// Uniform f32 count — see module doc.
@@ -73,30 +68,31 @@ struct Gpu {
     /// The instanced ring pipeline.
     pipeline: web_sys::GpuRenderPipeline,
     /// Uniform block — the 16-f32 layout above.
-    ubuf: web_sys::GpuBuffer,
+    uniform_buffer: web_sys::GpuBuffer,
     /// Per-tile sheet — read-only storage; RefCell'd because
     /// `set_tiles` recreates the buffer on growth.
-    sheet: RefCell<web_sys::GpuBuffer>,
+    tile_sheet: RefCell<web_sys::GpuBuffer>,
     /// Sheet capacity in tiles — recreated on growth.
-    sheet_cap: Cell<u32>,
-    /// The bind-group layout (kept so `rebind` can rebuild `bind`).
+    sheet_capacity: Cell<u32>,
+    /// The bind-group layout (kept so the group can rebuild after
+    /// sheet swaps).
     layout: web_sys::GpuBindGroupLayout,
-    /// Bound resources — rebuilt by `rebind` after sheet swaps.
-    bind: RefCell<web_sys::GpuBindGroup>,
+    /// Bound resources — rebuilt after sheet swaps.
+    bind_group: RefCell<web_sys::GpuBindGroup>,
 }
 
 /// Scalar state repacked into the uniform block per frame.
 struct State {
-    /// Canvas DEVICE px — `res`.
-    dev: [f32; 2],
+    /// Canvas DEVICE px — `resolution_dev`.
+    device_size: [f32; 2],
     /// Hairline half-width (device px) — the ring's band edge.
-    hair: f32,
+    hairline_half: f32,
     /// Live tile count — mirrors the sheet's populated rows.
-    count: u32,
+    tile_count: u32,
     /// Ring edge color — var(--border-item-hover).
-    edge: [f32; 4],
+    edge_rgba: [f32; 4],
     /// Sheen core color — var(--color-accent-contrast).
-    accent: [f32; 4],
+    accent_rgba: [f32; 4],
 }
 
 /// Public wasm surface — one ring canvas per tile container.
@@ -107,7 +103,7 @@ pub struct RingSheen {
     /// Scalar state repacked per frame.
     state: RefCell<State>,
     /// Elapsed seconds — the 9s sweep clock.
-    clock: Cell<f32>,
+    clock_seconds: Cell<f32>,
 }
 
 #[wasm_bindgen]
@@ -115,16 +111,18 @@ impl RingSheen {
     /// `RingSheen::new` — un-initialized widget; `init` must follow.
     #[wasm_bindgen(constructor)]
     pub fn new() -> RingSheen {
+        // Pre-init state: no GPU yet, empty tile list; the colors are
+        // placeholders — `set_colors` pushes theme values on mount.
         RingSheen {
             gpu: RefCell::new(None),
             state: RefCell::new(State {
-                dev: [1.0, 1.0],
-                hair: 1.0,
-                count: 0,
-                edge: [0.5, 0.5, 0.5, 0.8],
-                accent: [0.4, 0.7, 1.0, 1.0],
+                device_size: [1.0, 1.0],
+                hairline_half: 1.0,
+                tile_count: 0,
+                edge_rgba: [0.5, 0.5, 0.5, 0.8],
+                accent_rgba: [0.4, 0.7, 1.0, 1.0],
             }),
-            clock: Cell::new(0.0),
+            clock_seconds: Cell::new(0.0),
         }
     }
 
@@ -134,55 +132,70 @@ impl RingSheen {
     /// @param device The shared GPUDevice (one per page, from the JS bridge).
     /// @returns Ok on a live surface, Err(JsValue) on failure.
     pub fn init(&self, canvas: HtmlCanvasElement, device: GpuDevice) -> Result<(), JsValue> {
+        // Step 1 — wrap the canvas in a configured surface.
         let surface = gpu_mini::init_surface(&canvas, &device)?;
 
-        // binding 0 uniform · 1 tile sheet — vs reads both to place
-        // the ring quads, fs reads them for the SDF (gpu-mini's
-        // entries are VERTEX+FRAGMENT).
+        // Step 2 — bind-group layout: binding 0 uniform · 1 tile
+        // sheet — vs reads both to place the ring quads, fs reads
+        // them for the SDF (gpu-mini's entries are VERTEX+FRAGMENT).
         let layout = gpu_mini::new_layout(
             &surface.device,
             &[gpu_mini::uniform_entry(0), gpu_mini::storage_entry(1)],
         )?;
 
+        // Step 3 — compile the instanced-quad pipeline. The shader
+        // keeps its own vs_main, so it takes the helpers prelude
+        // (sd_round_box + quad_corner + easing), not the fullscreen
+        // triangle source.
+        let source = gpu_mini::wgsl::helpers_source(WGSL);
         let pipeline = gpu_mini::fullscreen_pipeline(
             &surface.device,
             surface.format,
-            WGSL,
+            &source,
             &[layout.clone()],
         )?;
 
-        let ubuf = gpu_mini::new_buffer(
+        // Step 4 — the 16-f32 uniform block (CPU-writable each frame).
+        let uniform_buffer = gpu_mini::new_buffer(
             &surface.device,
             (UNIFORM_F32S * 4) as u32,
             gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST,
         )?;
 
-        let sheet = gpu_mini::new_buffer(
+        // Step 5 — the tile sheet, 1-tile minimum capacity (0-size
+        // buffers are invalid); `set_tiles` regrows it on demand.
+        let tile_sheet = gpu_mini::new_buffer(
             &surface.device,
             (TILE_F32S * 4) as u32,
             gpu_buffer_usage::STORAGE | gpu_buffer_usage::COPY_DST,
         )?;
 
-        let bind = gpu_mini::new_bind_group(
+        // Step 6 — bind both buffers; the group is rebuilt when the
+        // sheet regrows (bind groups are immutable).
+        let bind_group = gpu_mini::new_bind_group(
             &surface.device,
             &layout,
             &[
-                gpu_mini::bind_buffer_entry(0, &ubuf),
-                gpu_mini::bind_buffer_entry(1, &sheet),
+                gpu_mini::bind_buffer_entry(0, &uniform_buffer),
+                gpu_mini::bind_buffer_entry(1, &tile_sheet),
             ],
         );
 
         let Ok(mut slot) = self.gpu.try_borrow_mut() else {
             return Err(JsValue::from_str("init: gpu slot poisoned"));
         };
+
+        // Publish the bundle — sheet_capacity starts at 1 (the minimum
+        // alloc above), bind_group is populated (not Option — the
+        // sheet is always bound, even at 0 live tiles).
         *slot = Some(Gpu {
             surface,
             pipeline,
-            ubuf,
-            sheet: RefCell::new(sheet),
-            sheet_cap: Cell::new(1),
+            uniform_buffer,
+            tile_sheet: RefCell::new(tile_sheet),
+            sheet_capacity: Cell::new(1),
             layout,
-            bind: RefCell::new(bind),
+            bind_group: RefCell::new(bind_group),
         });
 
         Ok(())
@@ -203,157 +216,211 @@ impl RingSheen {
             return 0;
         };
 
-        let Some(g) = gpu.as_ref() else {
+        // Still `None` → init hasn't resolved; report 0 tiles so JS
+        // stays on the CSS path.
+        let Some(gpu_state) = gpu.as_ref() else {
             return 0;
         };
 
-        let count = (values.len() / TILE_F32S) as u32;
+        // Whole tiles in the flat array — a malformed length floors
+        // out; the leftover tail is ignored.
+        let tile_count = (values.len() / TILE_F32S) as u32;
 
-        let Ok(mut s) = self.state.try_borrow_mut() else {
+        let Ok(mut state) = self.state.try_borrow_mut() else {
             return 0;
         };
 
-        s.count = count;
-        drop(s);
+        // Publish the live count before the upload — `frame` reads it
+        // as the instance count.
+        state.tile_count = tile_count;
 
-        if count == 0 {
+        drop(state);
+
+        // Empty sheet → nothing to upload; 0 already reported above.
+        if tile_count == 0 {
             return 0;
         }
 
-        if count > g.sheet_cap.get() {
+        if tile_count > gpu_state.sheet_capacity.get() {
             // A device fault mid-regrow keeps the old sheet — the
             // upload below clips to the old capacity instead of a
             // wasm panic inside the tile callback.
-            let Ok(sheet) = gpu_mini::new_buffer(
-                &g.surface.device,
+            let Ok(tile_sheet) = gpu_mini::new_buffer(
+                &gpu_state.surface.device,
                 (values.len() * 4) as u32,
                 gpu_buffer_usage::STORAGE | gpu_buffer_usage::COPY_DST,
             ) else {
                 return 0;
             };
 
-            let Ok(mut sh) = g.sheet.try_borrow_mut() else {
+            // Swap in the grown buffer…
+            let Ok(mut sheet_slot) = gpu_state.tile_sheet.try_borrow_mut() else {
                 return 0;
             };
-            *sh = sheet;
-            drop(sh);
-            g.sheet_cap.set(count);
+
+            *sheet_slot = tile_sheet;
+
+            drop(sheet_slot);
+
+            // …and record the new capacity so the next set_tiles only
+            // regrows when it actually exceeds it.
+            gpu_state.sheet_capacity.set(tile_count);
 
             // Bind groups are immutable — the new buffer needs a new
             // group (cold path: only on growth, once per trigger).
-            let Ok(sheet_ref) = g.sheet.try_borrow() else {
+            let Ok(sheet_ref) = gpu_state.tile_sheet.try_borrow() else {
                 return 0;
             };
-            let bind = gpu_mini::new_bind_group(
-                &g.surface.device,
-                &g.layout,
+            let bind_group = gpu_mini::new_bind_group(
+                &gpu_state.surface.device,
+                &gpu_state.layout,
                 &[
-                    gpu_mini::bind_buffer_entry(0, &g.ubuf),
+                    gpu_mini::bind_buffer_entry(0, &gpu_state.uniform_buffer),
                     gpu_mini::bind_buffer_entry(1, &sheet_ref),
                 ],
             );
             drop(sheet_ref);
 
-            let Ok(mut b) = g.bind.try_borrow_mut() else {
+            // Publish the rebuilt group — `frame` binds it next tick.
+            let Ok(mut bind_slot) = gpu_state.bind_group.try_borrow_mut() else {
                 return 0;
             };
-            *b = bind;
+
+            *bind_slot = bind_group;
         }
 
-        let Ok(sheet_ref) = g.sheet.try_borrow() else {
+        // Upload the whole flat sheet (viewed as raw bytes) into the
+        // storage buffer — capacity is guaranteed by the grow path.
+        let Ok(sheet_ref) = gpu_state.tile_sheet.try_borrow() else {
             return 0;
         };
-        let _ = g.surface.queue.write_buffer_with_u32_and_u8_slice(
+
+        let _ = gpu_state.surface.queue.write_buffer_with_u32_and_u8_slice(
             &sheet_ref,
             0,
             gpu_mini::f32_bytes(values),
         );
 
-        count
+        tile_count
     }
 
     /// `set_colors` — push the live theme colors (computed style read
     /// once per theme flip — the shader never sees CSS vars).
     ///
-    /// @param er @param eg @param eb @param ea Ring edge rgba 0-1.
-    /// @param ar @param ag @param ab @param aa Sheen core rgba 0-1.
-    /// @param hair Hairline half-width in device px.
+    /// @param edge_red @param edge_green @param edge_blue
+    ///   @param edge_alpha Ring edge rgba 0-1.
+    /// @param accent_red @param accent_green @param accent_blue
+    ///   @param accent_alpha Sheen core rgba 0-1.
+    /// @param hairline_half Hairline half-width in device px.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_colors(
         &self,
-        er: f32,
-        eg: f32,
-        eb: f32,
-        ea: f32,
-        ar: f32,
-        ag: f32,
-        ab: f32,
-        aa: f32,
-        hair: f32,
+        edge_red: f32,
+        edge_green: f32,
+        edge_blue: f32,
+        edge_alpha: f32,
+        accent_red: f32,
+        accent_green: f32,
+        accent_blue: f32,
+        accent_alpha: f32,
+        hairline_half: f32,
     ) {
-        let Ok(mut s) = self.state.try_borrow_mut() else {
+        let Ok(mut state) = self.state.try_borrow_mut() else {
             return;
         };
 
-        s.edge = [er, eg, eb, ea];
-        s.accent = [ar, ag, ab, aa];
-        s.hair = hair;
+        // Store the theme-resolved colors + hairline verbatim — the
+        // shader modulates them on the sweep loop, never reading CSS.
+        state.edge_rgba = [edge_red, edge_green, edge_blue, edge_alpha];
+
+        state.accent_rgba = [accent_red, accent_green, accent_blue, accent_alpha];
+
+        state.hairline_half = hairline_half;
     }
 
     /// `set_size` — CSS px (contract parity; unused — device px only).
     ///
-    /// @param _w @param _h CSS size — unused.
-    pub fn set_size(&self, _w: f32, _h: f32) {}
+    /// @param _width @param _height CSS size — unused.
+    pub fn set_size(&self, _width: f32, _height: f32) {}
 
-    /// `resize` — device px — the `res` uniform.
+    /// `resize` — device px — the `resolution_dev` uniform.
     ///
-    /// @param w @param h Backing size in device pixels.
-    pub fn resize(&self, w: f32, h: f32) {
-        let Ok(mut s) = self.state.try_borrow_mut() else {
+    /// @param width @param height Backing size in device pixels.
+    pub fn resize(&self, width: f32, height: f32) {
+        // Store the device-px backing size — `resolution_dev`.
+        let Ok(mut state) = self.state.try_borrow_mut() else {
             return;
         };
 
-        s.dev = [w, h];
+        state.device_size = [width, height];
     }
 
     /// `frame` — advance the sweep clock, repack, draw all tiles.
     ///
-    /// @param dt Frame delta in seconds.
+    /// @param delta_seconds Frame delta in seconds.
     /// @returns false once the surface is stale/lost.
-    pub fn frame(&self, dt: f32) -> bool {
+    pub fn frame(&self, delta_seconds: f32) -> bool {
+        // Bail while init is in flight — `false` tells JS to stop
+        // pumping (or keep the CSS path).
         let Ok(gpu) = self.gpu.try_borrow() else {
             return false;
         };
 
-        let Some(g) = gpu.as_ref() else {
+        // Still `None` → init hasn't resolved.
+        let Some(gpu_state) = gpu.as_ref() else {
             return false;
         };
 
-        let t = self.clock.get() + dt;
+        // Advance the sweep clock — summing dt absorbs rAF jitter.
+        let elapsed = self.clock_seconds.get() + delta_seconds;
 
-        self.clock.set(t);
+        self.clock_seconds.set(elapsed);
 
-        let Ok(s) = self.state.try_borrow() else {
+        // Snapshot the scalar state — the guard lives only through
+        // the repack below, never across the queue write.
+        let Ok(state) = self.state.try_borrow() else {
             return false;
         };
-        let mut u = [0.0f32; UNIFORM_F32S];
 
-        u[0] = s.dev[0];
-        u[1] = s.dev[1];
-        u[2] = t;
-        u[3] = s.hair;
-        u[4..8].copy_from_slice(&s.edge);
-        u[8..12].copy_from_slice(&s.accent);
+        // Zero-init the block, then fill the documented layout…
+        let mut uniforms = [0.0f32; UNIFORM_F32S];
 
-        gpu_mini::write_f32s(&g.surface.queue, &g.ubuf, &u);
+        // [0,1] resolution_dev · [2] time_seconds · [3] hairline half.
+        uniforms[0] = state.device_size[0];
 
-        if s.count == 0 {
+        uniforms[1] = state.device_size[1];
+
+        uniforms[2] = elapsed;
+
+        uniforms[3] = state.hairline_half;
+
+        // [4..8] ring edge rgba, [8..12] sheen-core rgba.
+        uniforms[4..8].copy_from_slice(&state.edge_rgba);
+
+        uniforms[8..12].copy_from_slice(&state.accent_rgba);
+
+        // Push the block to the GPU…
+        gpu_mini::write_f32s(&gpu_state.surface.queue, &gpu_state.uniform_buffer, &uniforms);
+
+        // Zero live tiles → nothing to draw, but the surface is still
+        // live — report true so JS keeps pumping.
+        if state.tile_count == 0 {
             return true;
         }
 
-        let Ok(bind) = g.bind.try_borrow() else {
+        // …then the instanced draw: 6 verts per ring quad × count.
+        let Ok(bind_group) = gpu_state.bind_group.try_borrow() else {
             return false;
         };
-        let ok = gpu_mini::draw_n(&g.surface, &g.pipeline, &bind, None, 6, s.count);
+
+        let ok = gpu_mini::draw_n(
+            &gpu_state.surface,
+            &gpu_state.pipeline,
+            &bind_group,
+            None,
+            6,
+            state.tile_count,
+        );
 
         ok
     }
@@ -368,8 +435,8 @@ impl RingSheen {
 /// the handles is both safe and un-panickable.
 impl Drop for RingSheen {
     fn drop(&mut self) {
-        if let Some(g) = self.gpu.get_mut().take() {
-            std::mem::forget(g);
+        if let Some(gpu_state) = self.gpu.get_mut().take() {
+            std::mem::forget(gpu_state);
         }
     }
 }

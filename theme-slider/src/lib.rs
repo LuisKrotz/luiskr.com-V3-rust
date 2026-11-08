@@ -3,19 +3,19 @@
 //! Standalone per-widget artifact — see `rust/README.md`. The WGSL is
 //! the largest widget shader (a full procedural scene: sky gradient,
 //! starfield, sun+corona, aurora, crescent moon, two parallax mesas,
-//! 3D knob); `progress` 0..2 morphs night → system → day.
+//! 3D knob); `theme_progress` 0..2 morphs night → system → day.
 //!
 //! # Uniform layout (f32s = 12 — mirrors
 //! `GPU_WIDGET_UNIFORM_F32S[THEME_SLIDER]` and the WGSL struct)
 //!
-//!   [0,1]  res         canvas CSS px (aspect-corrected scene domain)
-//!   [2]    time        seconds — star twinkle, aurora, corona, shimmer
-//!   [3]    progress    0..2 — 0..1 night→system, 1..2 system→day
-//!   [4]    knob_x      knob center X in px (JS spring)
-//!   [5]    ripple_time seconds-stamp of last tap (−1 = none)
-//!   [6]    ripple_pos  tap X in px → expanding ring origin
-//!   [7]    pad         16B alignment pad
-//!   [8..11] rect       (0,0,w,h) on the dedicated canvas
+//!   [0,1]  resolution_css canvas CSS px (aspect-corrected scene domain)
+//!   [2]    time_seconds   seconds — star twinkle, aurora, corona, shimmer
+//!   [3]    theme_progress 0..2 — 0..1 night→system, 1..2 system→day
+//!   [4]    knob_center_x  knob center X in px (JS spring)
+//!   [5]    ripple_time    seconds-stamp of last tap (−1 = none)
+//!   [6]    ripple_pos     tap X in px → expanding ring origin
+//!   [7]    reserved       16B alignment pad
+//!   [8..11] clip_rect     (0,0,w,h) on the dedicated canvas
 //!
 //! # Frame cost
 //!
@@ -27,7 +27,9 @@ use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
 use web_sys::{GpuDevice, HtmlCanvasElement};
 
-/// WGSL — the procedural day/night sky scene.
+/// WGSL — the procedural day/night sky scene fragment chunk (shared
+/// dist_to_segment + vs_main arrive via the gpu-mini library; the
+/// star hash stays local — a different seed would re-roll the sky).
 const WGSL: &str = include_str!("theme_slider.wgsl");
 
 /// Uniform f32 count — see module doc.
@@ -35,16 +37,16 @@ const UNIFORM_F32S: usize = 12;
 
 /// Slider state repacked into the uniform block per frame.
 struct State {
-    /// Canvas CSS px — the `res` field (design-unit domain).
-    css: [f32; 2],
-    /// Canvas DEVICE px — the `rect.zw` divisor mapping `frag`
-    /// (device px) into widget uv 0..1. Written by `resize`.
-    dev: [f32; 2],
+    /// Canvas CSS px — the `resolution_css` field (design-unit domain).
+    css_size: [f32; 2],
+    /// Canvas DEVICE px — the `clip_rect.zw` divisor mapping
+    /// `pixel_coord` (device px) into widget uv 0..1. Written by `resize`.
+    device_size: [f32; 2],
     /// 0..2 theme morph (JS eases; clamp keeps the shader's two
     /// mix() arms well-defined).
-    progress: f32,
+    theme_progress: f32,
     /// Knob center X in px — JS owns the spring.
-    knob_x: f32,
+    knob_center_x: f32,
     /// Seconds-stamp of the last tap (−1 = none — the shader's
     /// `>= 0` guard keeps it inert).
     ripple_time: f32,
@@ -60,7 +62,7 @@ pub struct ThemeSlider {
     /// Scalar state repacked per frame.
     state: RefCell<State>,
     /// Accumulated seconds — absorbs rAF jitter.
-    clock: Cell<f32>,
+    clock_seconds: Cell<f32>,
 }
 
 #[wasm_bindgen]
@@ -68,17 +70,20 @@ impl ThemeSlider {
     /// `ThemeSlider::new` — un-initialized widget; `init` must follow.
     #[wasm_bindgen(constructor)]
     pub fn new() -> ThemeSlider {
+        // Pre-init state: no GPU yet; night scene (progress 0), knob at
+        // the left edge, ripple_time = −1 (no tap recorded, so the
+        // ring stays dormant).
         ThemeSlider {
             gpu: RefCell::new(None),
             state: RefCell::new(State {
-                css: [1.0, 1.0],
-                dev: [1.0, 1.0],
-                progress: 0.0,
-                knob_x: 0.0,
+                css_size: [1.0, 1.0],
+                device_size: [1.0, 1.0],
+                theme_progress: 0.0,
+                knob_center_x: 0.0,
                 ripple_time: -1.0,
                 ripple_pos: 0.0,
             }),
-            clock: Cell::new(0.0),
+            clock_seconds: Cell::new(0.0),
         }
     }
 
@@ -100,107 +105,135 @@ impl ThemeSlider {
             return Err(JsValue::from_str("init: gpu slot poisoned"));
         };
 
+        // Publish the live scaffold — `frame` may now borrow it.
         *slot = Some(built);
+
         Ok(())
     }
 
     /// `resize` — canvas-bitmap change → surface re-configure.
     ///
-    /// @param _w Device-pixel width (element-side).
-    /// @param _h Device-pixel height.
-    pub fn resize(&self, w: u32, h: u32) {
-        if let Ok(mut s) = self.state.try_borrow_mut() {
-            s.dev = [(w.max(1)) as f32, (h.max(1)) as f32];
+    /// @param width Device-pixel width (element-side).
+    /// @param height Device-pixel height.
+    pub fn resize(&self, width: u32, height: u32) {
+        // Store the device-px size (clip_rect.zw); clamped ≥1 so the
+        // frag→uv divisor never sees a zero-sized canvas.
+        if let Ok(mut state) = self.state.try_borrow_mut() {
+            state.device_size = [(width.max(1)) as f32, (height.max(1)) as f32];
         }
 
+        // Bail while init is in flight — the surface configures
+        // itself when it arrives.
         let Ok(gpu) = self.gpu.try_borrow() else {
             return;
         };
 
-        if let Some(w) = gpu.as_ref() {
-            gpu_mini::resize(&w.surface);
+        // Re-configure the live surface to match the new bitmap.
+        if let Some(widget) = gpu.as_ref() {
+            gpu_mini::resize(&widget.surface);
         }
     }
 
-    /// `set_size` — the canvas's CSS-pixel size (res + rect).
+    /// `set_size` — the canvas's CSS-pixel size (resolution_css +
+    /// clip_rect).
     ///
-    /// @param w Canvas width in CSS pixels.
-    /// @param h Canvas height in CSS pixels.
-    pub fn set_size(&self, w: f32, h: f32) {
-        if let Ok(mut s) = self.state.try_borrow_mut() {
-            s.css = [w.max(1.0), h.max(1.0)];
+    /// @param width Canvas width in CSS pixels.
+    /// @param height Canvas height in CSS pixels.
+    pub fn set_size(&self, width: f32, height: f32) {
+        // CSS-px pair — ≥1 clamp; `resolution_css` is the aspect-
+        // corrected scene domain the shader projects from.
+        if let Ok(mut state) = self.state.try_borrow_mut() {
+            state.css_size = [width.max(1.0), height.max(1.0)];
         }
     }
 
     /// `set_state` — bundled scalar update: eased progress + knob X.
     ///
-    /// @param progress 0..2 theme morph (0..1 night→system,
-    ///                 1..2 system→day; clamped to the shader's domain).
-    /// @param knob_x Knob center X in px.
-    pub fn set_state(&self, progress: f32, knob_x: f32) {
-        let Ok(mut s) = self.state.try_borrow_mut() else {
+    /// @param theme_progress 0..2 theme morph (0..1 night→system,
+    ///   1..2 system→day; clamped to the shader's domain).
+    /// @param knob_center_x Knob center X in px.
+    pub fn set_state(&self, theme_progress: f32, knob_center_x: f32) {
+        let Ok(mut state) = self.state.try_borrow_mut() else {
             return;
         };
 
-        s.progress = progress.clamp(0.0, 2.0);
-        s.knob_x = knob_x;
+        // Clamp the theme morph into 0..2 — the shader's two mix()
+        // arms are only defined inside it.
+        state.theme_progress = theme_progress.clamp(0.0, 2.0);
+
+        // Knob position — verbatim; JS owns the spring math.
+        state.knob_center_x = knob_center_x;
     }
 
     /// `tap` — registers a tap for the expanding-ring ripple: the JS
     /// bridge passes its clock time + the tap's X position.
     ///
-    /// @param time The frame clock's current seconds (matches what
-    ///              `frame` accumulates — the shader compares
-    ///              `u.time - ripple_time`).
-    /// @param x Tap X in canvas CSS px.
-    pub fn tap(&self, time: f32, x: f32) {
-        let Ok(mut s) = self.state.try_borrow_mut() else {
+    /// @param time_seconds The frame clock's current seconds (matches
+    ///   what `frame` accumulates — the shader compares
+    ///   `time_seconds - ripple_time`).
+    /// @param tap_x Tap X in canvas CSS px.
+    pub fn tap(&self, time_seconds: f32, tap_x: f32) {
+        let Ok(mut state) = self.state.try_borrow_mut() else {
             return;
         };
 
-        s.ripple_time = time;
-        s.ripple_pos = x;
+        // Stamp the tap on the frame clock + its X position — the
+        // shader expands the ring from `time − ripple_time` outward
+        // from `ripple_pos`.
+        state.ripple_time = time_seconds;
+
+        state.ripple_pos = tap_x;
     }
 
     /// `frame` — one animation tick: pack, write, draw.
     ///
-    /// @param dt Seconds since the previous call.
-    pub fn frame(&self, dt: f32) {
+    /// @param delta_seconds Seconds since the previous call.
+    pub fn frame(&self, delta_seconds: f32) {
+        // Bail while init is in flight — a contended slot skips a tick.
         let Ok(gpu) = self.gpu.try_borrow() else {
             return;
         };
 
-        let Some(w) = gpu.as_ref() else {
+        // Still `None` → init hasn't resolved; nothing to draw yet.
+        let Some(widget) = gpu.as_ref() else {
             return;
         };
 
-        self.clock.set(self.clock.get() + dt);
+        // Advance the scene clock — summing dt absorbs rAF jitter.
+        self.clock_seconds
+            .set(self.clock_seconds.get() + delta_seconds);
 
-        let Ok(s) = self.state.try_borrow() else {
+        // Snapshot the scalar state under the guard…
+        let Ok(state) = self.state.try_borrow() else {
             return;
         };
 
-        // [0,1] res [2] time [3] progress [4] knob_x
-        // [5] ripple_time [6] ripple_pos [7] pad [8..11] rect
+        // [0,1] resolution_css [2] time_seconds [3] theme_progress
+        // [4] knob_center_x [5] ripple_time [6] ripple_pos
+        // [7] reserved [8..11] clip_rect
         let uniforms: [f32; UNIFORM_F32S] = [
-            s.css[0],
-            s.css[1],
-            self.clock.get(),
-            s.progress,
-            s.knob_x,
-            s.ripple_time,
-            s.ripple_pos,
+            state.css_size[0],
+            state.css_size[1],
+            self.clock_seconds.get(),
+            state.theme_progress,
+            state.knob_center_x,
+            state.ripple_time,
+            state.ripple_pos,
             0.0,
             0.0,
             0.0,
-            s.dev[0],
-            s.dev[1],
+            state.device_size[0],
+            state.device_size[1],
         ];
 
-        drop(s);
+        // Release the state borrow BEFORE the GPU calls — no RefCell
+        // guard may be held across the JS-boundary work.
+        drop(state);
 
-        if !gpu_mini::widget_frame(w, &uniforms) {
-            gpu_mini::resize(&w.surface);
+        // Write + draw; a stale/lost surface re-configures itself so
+        // the next frame recovers cleanly.
+        if !gpu_mini::widget_frame(widget, &uniforms) {
+            gpu_mini::resize(&widget.surface);
         }
     }
 }
@@ -212,8 +245,8 @@ impl ThemeSlider {
 /// shared device; leaking the handles is safe and un-panickable.
 impl Drop for ThemeSlider {
     fn drop(&mut self) {
-        if let Some(g) = self.gpu.get_mut().take() {
-            std::mem::forget(g);
+        if let Some(gpu_state) = self.gpu.get_mut().take() {
+            std::mem::forget(gpu_state);
         }
     }
 }

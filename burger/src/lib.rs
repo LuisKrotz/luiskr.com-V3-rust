@@ -7,10 +7,10 @@
 //! # Uniform layout (f32s — mirrors `GPU_WIDGET_UNIFORM_F32S[BURGER]`
 //! = 8 and the WGSL `Uniforms` struct; bump all three together)
 //!
-//!   [0]    time    accumulated seconds — drives the wave/breathe sines
-//!   [1,2]  res     canvas CSS px (the shader's pixel domain)
-//!   [3]    dark    0.0 light → 1.0 dark theme lerp
-//!   [4..7] rect    widget clip rect — (0,0,w,h) on a dedicated canvas
+//!   [0]    time_seconds    accumulated seconds — drives the wave/breathe sines
+//!   [1,2]  resolution_css  canvas CSS px (the shader's pixel domain)
+//!   [3]    theme_dark      0.0 light → 1.0 dark theme lerp
+//!   [4..7] clip_rect       widget clip rect — (0,0,w,h) on a dedicated canvas
 //!
 //! # Frame cost
 //!
@@ -21,7 +21,8 @@ use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
 use web_sys::{GpuDevice, HtmlCanvasElement};
 
-/// WGSL — the hairline-bars shader (fluid wave + breathing pulse).
+/// WGSL — the hairline-bars fragment chunk (fluid wave + breathing
+/// pulse); the shared helpers + vs_main arrive via the gpu-mini lib.
 const WGSL: &str = include_str!("burger.wgsl");
 
 /// Uniform f32 count — see module doc; mirrored by the JS token.
@@ -32,17 +33,17 @@ const UNIFORM_F32S: usize = 8;
 pub struct Burger {
     /// GPU scaffold — `None` until `init` resolves.
     gpu: RefCell<Option<gpu_mini::Widget>>,
-    /// Canvas CSS px — the `res` field (the shader's design-unit
-    /// domain; see UNITS in the module doc).
-    css: RefCell<[f32; 2]>,
-    /// Canvas DEVICE px — the `rect.zw` divisor that maps `frag`
-    /// (device px) into widget uv 0..1. Written by `resize`.
-    dev: Cell<[f32; 2]>,
+    /// Canvas CSS px — the `resolution_css` field (the shader's
+    /// design-unit domain; see UNITS in the module doc).
+    css_size: RefCell<[f32; 2]>,
+    /// Canvas DEVICE px — the `clip_rect.zw` divisor that maps
+    /// `pixel_coord` (device px) into widget uv 0..1. Written by `resize`.
+    device_size: Cell<[f32; 2]>,
     /// Theme lerp 0..1 (light → dark).
-    dark: Cell<f32>,
+    theme_dark: Cell<f32>,
     /// Accumulated seconds — absorbs rAF jitter so the wave never
     /// visibly jumps phase.
-    clock: Cell<f32>,
+    clock_seconds: Cell<f32>,
 }
 
 #[wasm_bindgen]
@@ -52,10 +53,10 @@ impl Burger {
     pub fn new() -> Burger {
         Burger {
             gpu: RefCell::new(None),
-            css: RefCell::new([1.0, 1.0]),
-            dev: Cell::new([1.0, 1.0]),
-            dark: Cell::new(0.0),
-            clock: Cell::new(0.0),
+            css_size: RefCell::new([1.0, 1.0]),
+            device_size: Cell::new([1.0, 1.0]),
+            theme_dark: Cell::new(0.0),
+            clock_seconds: Cell::new(0.0),
         }
     }
 
@@ -82,79 +83,82 @@ impl Burger {
     }
 
     /// `resize` — canvas-bitmap change → surface re-configure + the
-    /// DEVICE-pixel size that becomes `rect.zw` (the frag→uv divisor;
-    /// `frag` arrives in device px, so the divisor must too, or every
-    /// widget renders squashed at DPR ≠ 1).
+    /// DEVICE-pixel size that becomes `clip_rect.zw` (the frag→uv
+    /// divisor; `pixel_coord` arrives in device px, so the divisor must
+    /// too, or every widget renders squashed at DPR ≠ 1).
     ///
-    /// @param w Device-pixel width (element CSS px × DPR).
-    /// @param h Device-pixel height.
-    pub fn resize(&self, w: u32, h: u32) {
-        self.dev.set([(w.max(1)) as f32, (h.max(1)) as f32]);
+    /// @param width Device-pixel width (element CSS px × DPR).
+    /// @param height Device-pixel height.
+    pub fn resize(&self, width: u32, height: u32) {
+        self.device_size
+            .set([(width.max(1)) as f32, (height.max(1)) as f32]);
 
         let Ok(gpu) = self.gpu.try_borrow() else {
             return;
         };
 
-        if let Some(w) = gpu.as_ref() {
-            gpu_mini::resize(&w.surface);
+        if let Some(widget) = gpu.as_ref() {
+            gpu_mini::resize(&widget.surface);
         }
     }
 
-    /// `set_size` — the canvas's CSS-pixel size (the `res` field —
-    /// the shader's design-unit domain; `uv * res` yields CSS px).
+    /// `set_size` — the canvas's CSS-pixel size (the `resolution_css`
+    /// field — the shader's design-unit domain; `widget_uv *
+    /// resolution_css` yields CSS px positions).
     ///
-    /// @param w Canvas width in CSS pixels.
-    /// @param h Canvas height in CSS pixels.
-    pub fn set_size(&self, w: f32, h: f32) {
-        if let Ok(mut c) = self.css.try_borrow_mut() {
-            *c = [w.max(1.0), h.max(1.0)];
+    /// @param width Canvas width in CSS pixels.
+    /// @param height Canvas height in CSS pixels.
+    pub fn set_size(&self, width: f32, height: f32) {
+        if let Ok(mut css_size) = self.css_size.try_borrow_mut() {
+            *css_size = [width.max(1.0), height.max(1.0)];
         }
     }
 
     /// `set_dark` — the theme lerp: 0 = light, 1 = dark. Clamped —
     /// the shader lerps ink colors on this factor.
     ///
-    /// @param v Theme darkness 0..1.
-    pub fn set_dark(&self, v: f32) {
-        self.dark.set(v.clamp(0.0, 1.0));
+    /// @param theme_dark Theme darkness 0..1.
+    pub fn set_dark(&self, theme_dark: f32) {
+        self.theme_dark.set(theme_dark.clamp(0.0, 1.0));
     }
 
     /// `frame` — one animation tick: pack the 8-f32 block, write, draw.
     ///
-    /// @param dt Seconds since the previous call.
-    pub fn frame(&self, dt: f32) {
+    /// @param delta_seconds Seconds since the previous call.
+    pub fn frame(&self, delta_seconds: f32) {
         let Ok(gpu) = self.gpu.try_borrow() else {
             return;
         };
 
-        let Some(w) = gpu.as_ref() else {
+        let Some(widget) = gpu.as_ref() else {
             return;
         };
 
-        self.clock.set(self.clock.get() + dt);
+        self.clock_seconds
+            .set(self.clock_seconds.get() + delta_seconds);
 
-        let Ok(css_ref) = self.css.try_borrow() else {
+        let Ok(css_ref) = self.css_size.try_borrow() else {
             return;
         };
-        let css = *css_ref;
+        let css_size = *css_ref;
         drop(css_ref);
-        let dev = self.dev.get();
+        let device_size = self.device_size.get();
 
-        // [0] time  [1,2] res (CSS px)  [3] dark
-        // [4..7] rect = (0,0,dev) — DEVICE px, the frag→uv divisor
+        // [0] time_seconds  [1,2] resolution_css  [3] theme_dark
+        // [4..7] clip_rect = (0,0,device_size) — DEVICE px, the frag→uv divisor
         let uniforms: [f32; UNIFORM_F32S] = [
-            self.clock.get(),
-            css[0],
-            css[1],
-            self.dark.get(),
+            self.clock_seconds.get(),
+            css_size[0],
+            css_size[1],
+            self.theme_dark.get(),
             0.0,
             0.0,
-            dev[0],
-            dev[1],
+            device_size[0],
+            device_size[1],
         ];
 
-        if !gpu_mini::widget_frame(w, &uniforms) {
-            gpu_mini::resize(&w.surface);
+        if !gpu_mini::widget_frame(widget, &uniforms) {
+            gpu_mini::resize(&widget.surface);
         }
     }
 }
@@ -166,8 +170,8 @@ impl Burger {
 /// shared device; leaking the handles is safe and un-panickable.
 impl Drop for Burger {
     fn drop(&mut self) {
-        if let Some(g) = self.gpu.get_mut().take() {
-            std::mem::forget(g);
+        if let Some(gpu) = self.gpu.get_mut().take() {
+            std::mem::forget(gpu);
         }
     }
 }

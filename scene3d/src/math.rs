@@ -210,6 +210,8 @@ impl Mat4 {
     pub fn mul(self, o: Mat4) -> Mat4 {
         let mut out = [0.0f32; 16];
 
+        // Column-major walk: for each output column c, row r — the
+        // dot of self's row r (strided) with o's column c (contiguous).
         for c in 0..4 {
             for r in 0..4 {
                 out[c * 4 + r] = self.m[r] * o.m[c * 4]
@@ -231,48 +233,65 @@ impl Mat4 {
     /// @param p Point to transform.
     /// @returns `(transformed_xyz, w)` — w is 1 for affine transforms.
     pub fn transform_point(self, p: Vec3) -> (Vec3, f32) {
+        // Four dot products — each output row is the point dotted
+        // against that matrix row, with the translation column folded
+        // in as the implicit w=1 term.
         let x = self.m[0] * p.x + self.m[4] * p.y + self.m[8] * p.z + self.m[12];
+
         let y = self.m[1] * p.x + self.m[5] * p.y + self.m[9] * p.z + self.m[13];
+
         let z = self.m[2] * p.x + self.m[6] * p.y + self.m[10] * p.z + self.m[14];
+
+        // w row — 1 for affine matrices, the perspective-divide source
+        // for projections.
         let w = self.m[3] * p.x + self.m[7] * p.y + self.m[11] * p.z + self.m[15];
 
         (Vec3::new(x, y, z), w)
     }
 
     /// `translation` — build a pure-translate matrix: I with the
-    /// offset in the last column. Points pick up +t; directions (w=0)
-    /// are unaffected — the defining property of translation.
+    /// offset in the last column. Points pick up +offset; directions
+    /// (w=0) are unaffected — the defining property of translation.
     ///
-    /// @param t Offset vector in parent space.
+    /// @param offset Offset vector in parent space.
     /// @returns Translation matrix.
-    pub fn translation(t: Vec3) -> Mat4 {
+    pub fn translation(offset: Vec3) -> Mat4 {
+        // Start from identity, write the offset into the translation
+        // column (indices 12..14 — the last column under column-major).
         let mut m = Mat4::IDENTITY.m;
 
-        m[12] = t.x;
-        m[13] = t.y;
-        m[14] = t.z;
+        m[12] = offset.x;
+
+        m[13] = offset.y;
+
+        m[14] = offset.z;
+
         Mat4 { m }
     }
 
     /// `scale` — build a pure-scale matrix: diag(sx, sy, sz, 1).
-    /// Uniform `s` preserves shape; per-axis values squash/stretch.
+    /// Uniform `factors` preserves shape; per-axis values squash/stretch.
     /// A ZERO scale collapses the axis — degenerate triangles with
     /// zero-area normals; the shader still runs but lighting breaks
     /// (normalizes a zero vector). Keep every axis > ε.
     ///
-    /// @param s Per-axis scale factors.
+    /// @param factors Per-axis scale factors.
     /// @returns Scale matrix.
-    pub fn scale(s: Vec3) -> Mat4 {
+    pub fn scale(factors: Vec3) -> Mat4 {
+        // Diagonal entries only — each axis scales independently.
         let mut m = Mat4::IDENTITY.m;
 
-        m[0] = s.x;
-        m[5] = s.y;
-        m[10] = s.z;
+        m[0] = factors.x;
+
+        m[5] = factors.y;
+
+        m[10] = factors.z;
+
         Mat4 { m }
     }
 
-    /// `rotation_y` — rotate about the UP axis by `a` radians (CCW when
-    /// viewed from +Y looking down — right-hand rule).
+    /// `rotation_y` — rotate about the UP axis by `angle_radians` (CCW
+    /// when viewed from +Y looking down — right-hand rule).
     ///
     /// The y-rotation matrix:
     ///   ⎡  cos a   0   sin a   0 ⎤
@@ -280,23 +299,31 @@ impl Mat4 {
     ///   ⎢ −sin a   0   cos a   0 ⎥
     ///   ⎣    0     0     0     1 ⎦
     /// Y stays fixed (row/col 1 is identity); the X/Z plane rotates.
-    /// `a` is RADIANS — pass degrees × π/180. One full orbit is 2π ≈
-    /// 6.2832; at 60fps `a += 0.001` is ~6°/s — a slow stately spin.
+    /// `angle_radians` is RADIANS — pass degrees × π/180. One full
+    /// orbit is 2π ≈ 6.2832; at 60fps `+= 0.001` is ~6°/s — a slow
+    /// stately spin.
     ///
-    /// @param a Angle in radians.
+    /// @param angle_radians Angle in radians.
     /// @returns Rotation matrix.
-    pub fn rotation_y(a: f32) -> Mat4 {
-        let (s, c) = a.sin_cos();
+    pub fn rotation_y(angle_radians: f32) -> Mat4 {
+        // One sincos call — both needed, half the trig cost.
+        let (s, c) = angle_radians.sin_cos();
+
         let mut m = Mat4::IDENTITY.m;
 
+        // The X/Z-plane rotation block (row 1 stays identity).
         m[0] = c;
+
         m[2] = -s;
+
         m[8] = s;
+
         m[10] = c;
+
         Mat4 { m }
     }
 
-    /// `rotation_x` — rotate about the RIGHT axis by `a` radians
+    /// `rotation_x` — rotate about the RIGHT axis by `angle_radians`
     /// (tilt up/down). The x-rotation matrix leaves column 0 fixed and
     /// rotates the Y/Z plane:
     ///   ⎡ 1    0       0      0 ⎤
@@ -304,16 +331,23 @@ impl Mat4 {
     ///   ⎢ 0  sin a   cos a    0 ⎥
     ///   ⎣ 0    0       0      1 ⎦
     ///
-    /// @param a Angle in radians.
+    /// @param angle_radians Angle in radians.
     /// @returns Rotation matrix.
-    pub fn rotation_x(a: f32) -> Mat4 {
-        let (s, c) = a.sin_cos();
+    pub fn rotation_x(angle_radians: f32) -> Mat4 {
+        // One sincos call for both coefficients.
+        let (s, c) = angle_radians.sin_cos();
+
         let mut m = Mat4::IDENTITY.m;
 
+        // The Y/Z-plane rotation block (row 0 stays identity).
         m[5] = c;
+
         m[6] = s;
+
         m[9] = -s;
+
         m[10] = c;
+
         Mat4 { m }
     }
 
@@ -345,14 +379,28 @@ impl Mat4 {
     /// @param far Far clip distance (> near).
     /// @returns Perspective projection matrix.
     pub fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
+        // Focal length in half-height units — the cotangent of the
+        // half-fov.
         let f = 1.0 / (fov_y * 0.5).tan();
+
+        // Most entries stay zero — only 5 fill in.
         let mut m = [0.0f32; 16];
 
+        // x-scale: focal / aspect (wide canvases shrink x to fit).
         m[0] = f / aspect;
+
+        // y-scale: the focal length itself.
         m[5] = f;
+
+        // z mapping: z' = (far·z − near·far)/((far−near)·z) after ÷w —
+        // [0,1] depth, the wgpu/D3D convention.
         m[10] = far / (near - far);
+
+        // −1 here is what makes w = −z_eye (the divide source).
         m[11] = -1.0;
+
         m[14] = (near * far) / (near - far);
+
         Mat4 { m }
     }
 
@@ -377,9 +425,16 @@ impl Mat4 {
     /// @param up Roll reference (usually +Y).
     /// @returns View matrix (world → eye space).
     pub fn look_at(eye: Vec3, target: Vec3, up: Vec3) -> Mat4 {
+        // Forward: where the camera looks.
         let fwd = target.sub(eye).normalized();
+
+        // Right: perpendicular to forward and the caller's up.
         let right = fwd.cross(up).normalized();
+
+        // Re-orthogonalized up — absorbs any non-perpendicularity in
+        // the caller's `up` so the basis is truly orthonormal.
         let up2 = right.cross(fwd);
+
         let mut m = Mat4::IDENTITY.m;
 
         // Rows of the basis (transposed columns = the inverse rotation),
@@ -430,9 +485,17 @@ impl Ray {
     /// @param radius Sphere radius.
     /// @returns Hit distance `t` along the ray, if any.
     pub fn intersect_sphere(&self, center: Vec3, radius: f32) -> Option<f32> {
+        // Vector from sphere center to ray origin — the quadratic's
+        // constant terms build on it.
         let oc = self.origin.sub(center);
+
+        // Half the linear coefficient — with |dir|=1, b = dir·oc.
         let b = oc.dot(self.dir);
+
+        // Constant term: |oc|² − r².
         let c = oc.dot(oc) - radius * radius;
+
+        // Discriminant — negative means the ray misses entirely.
         let h = b * b - c;
 
         if h < 0.0 {
@@ -440,13 +503,19 @@ impl Ray {
         }
 
         let h = h.sqrt();
+
+        // Near root first — the entry face.
         let t = -b - h;
 
         if t >= 0.0 {
+            // Normal hit — sphere in front of the ray.
             Some(t)
         } else if -b + h >= 0.0 {
+            // Near root behind the eye → the eye is INSIDE the sphere;
+            // the exit face is the closest forward hit.
             Some(-b + h)
         } else {
+            // Both roots behind — sphere is entirely behind the ray.
             None
         }
     }
@@ -544,20 +613,21 @@ impl Quat {
     /// expansion three.js's Quaternion.setFromEuler uses, so ported
     /// `rotation.set(x,y,z)` calls produce identical orientations.
     ///
-    /// @param x Radians about the x axis. @param y About y. @param z About z.
+    /// @param angle_x Radians about the x axis. @param angle_y About y.
+    /// @param angle_z About z.
     /// @returns Unit quaternion of the composed rotation.
-    pub fn from_euler(x: f32, y: f32, z: f32) -> Quat {
-        let (sx, cx) = (x * 0.5).sin_cos();
-        let (sy, cy) = (y * 0.5).sin_cos();
-        let (sz, cz) = (z * 0.5).sin_cos();
+    pub fn from_euler(angle_x: f32, angle_y: f32, angle_z: f32) -> Quat {
+        let (sin_x, cos_x) = (angle_x * 0.5).sin_cos();
+        let (sin_y, cos_y) = (angle_y * 0.5).sin_cos();
+        let (sin_z, cos_z) = (angle_z * 0.5).sin_cos();
 
         // qx⊗qy⊗qz expanded — each term is a product of one
         // component from each axis's half-quaternion.
         Quat::new(
-            sx * cy * cz + cx * sy * sz,
-            cx * sy * cz - sx * cy * sz,
-            cx * cy * sz + sx * sy * cz,
-            cx * cy * cz - sx * sy * sz,
+            sin_x * cos_y * cos_z + cos_x * sin_y * sin_z,
+            cos_x * sin_y * cos_z - sin_x * cos_y * sin_z,
+            cos_x * cos_y * sin_z + sin_x * sin_y * cos_z,
+            cos_x * cos_y * cos_z - sin_x * sin_y * sin_z,
         )
     }
 
@@ -694,12 +764,16 @@ impl Quat {
     ///
     /// @returns Unit-length quaternion.
     pub fn normalized(self) -> Quat {
+        // 4-norm of (x,y,z,w) — the quaternion's magnitude.
         let l = (self.x * self.x + self.y * self.y + self.z * self.z + self.w * self.w).sqrt();
 
+        // Degenerate input → IDENTITY, not NaN — a zero quaternion has
+        // no direction to preserve.
         if l < 1e-9 {
             return Quat::IDENTITY;
         }
 
+        // One reciprocal, four multiplies — cheaper than four divides.
         let inv = 1.0 / l;
 
         Quat::new(self.x * inv, self.y * inv, self.z * inv, self.w * inv)
@@ -715,18 +789,23 @@ impl Mat4 {
     /// stretch the translation vector; rotation must not orbit the
     /// translation).
     ///
-    /// @param t Translation (node position in parent space).
-    /// @param q Rotation quaternion.
-    /// @param s Per-axis scale.
+    /// @param translation Translation (node position in parent space).
+    /// @param rotation Rotation quaternion.
+    /// @param scale Per-axis scale.
     /// @returns The composed local transform.
-    pub fn compose(t: Vec3, q: Quat, s: Vec3) -> Mat4 {
+    pub fn compose(translation: Vec3, rotation: Quat, scale: Vec3) -> Mat4 {
         // T·R — rotate-then-translate — then fold scale into the basis
         // columns (scaling columns scales applied vectors, i.e. R·S).
-        let mut m = q.to_mat4().mul(Mat4::scale(s));
+        let mut m = rotation.to_mat4().mul(Mat4::scale(scale));
 
-        m.m[12] = t.x;
-        m.m[13] = t.y;
-        m.m[14] = t.z;
+        // Write the translation column over R·S's zero column —
+        // rotation/scale leave m[12..15] untouched, so setting it IS
+        // the T·(R·S) composition for an affine matrix.
+        m.m[12] = translation.x;
+
+        m.m[13] = translation.y;
+
+        m.m[14] = translation.z;
 
         m
     }

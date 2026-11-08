@@ -71,6 +71,8 @@ struct Graph {
 fn shape_after(id_end: &str) -> Option<(Shape, usize)> {
     let b = id_end.as_bytes();
 
+    // Two-byte openers (`[[`, `((`) checked before their single-byte
+    // prefixes — `[[` must not be read as `[` + a stray bracket.
     match b.first()? {
         b'[' if b.get(1) == Some(&b'[') => Some((Shape::Sub, 2)),
         b'[' => Some((Shape::Rect, 1)),
@@ -97,14 +99,20 @@ fn shape_close(shape: Shape) -> &'static str {
 /// Bare `id` gives label=id, Shape::Rect. `consumed` is byte length of
 /// the whole spec, so the edge splitter can resume after it.
 fn parse_node(spec: &str) -> Option<(String, Vec<String>, Shape, usize)> {
+    // Skip leading whitespace but remember its width — `consumed` is
+    // measured against the UNtrimmed spec for the edge splitter.
     let s = spec.trim_start();
+
     let lead = spec.len() - s.len();
+
     // The id ends at the first shape opener or whitespace.
     let id_len = s
         .find(|c: char| matches!(c, '[' | '{' | '(' | '>' | ' ' | '\t'))
         .unwrap_or(s.len());
+
     let id = s[..id_len].to_string();
 
+    // No id → not a node spec at all (e.g. an arrow token).
     if id.is_empty() {
         return None;
     }
@@ -114,7 +122,9 @@ fn parse_node(spec: &str) -> Option<(String, Vec<String>, Shape, usize)> {
     if let Some((shape, open_len)) = shape_after(rest) {
         // Labels may be "quoted" or bare — strip one quote pair.
         let body = &rest[open_len..];
+
         let close = shape_close(shape);
+
         let Some(end) = body.find(close) else {
             // Unterminated shape — treat the whole thing as a bare id.
             return Some((id.clone(), vec![id], Shape::Rect, lead + id_len));
@@ -122,17 +132,24 @@ fn parse_node(spec: &str) -> Option<(String, Vec<String>, Shape, usize)> {
 
         let mut label = &body[..end];
 
+        // Strip an optional quote pair around the label text.
         if label.starts_with('"') {
             label = &label[1..];
         }
+
         let label = label.strip_suffix('"').unwrap_or(label);
+
         let lines = label_lines(label);
+
+        // An empty label (A[""] or A[]) falls back to the id — an
+        // invisible node is worse than a self-labelled one.
         let lines = if lines.is_empty() {
             vec![id.clone()]
         } else {
             lines
         };
 
+        // consumed = lead + id + opener + label + closer.
         Some((
             id,
             lines,
@@ -140,6 +157,7 @@ fn parse_node(spec: &str) -> Option<(String, Vec<String>, Shape, usize)> {
             lead + id_len + open_len + end + close.len(),
         ))
     } else {
+        // Bare `id` — labels itself, Rect shape.
         Some((id.clone(), vec![id], Shape::Rect, lead + id_len))
     }
 }
@@ -147,6 +165,8 @@ fn parse_node(spec: &str) -> Option<(String, Vec<String>, Shape, usize)> {
 /// Edge operator at position — (kind, bytes consumed of the arrow part).
 /// Checks longest first so `-.->` isn't read as `---` + `.` leftovers.
 fn edge_op(s: &str) -> Option<(EdgeKind, usize)> {
+    // Longest/most-decorated operators first — `---` must come AFTER
+    // `-->`/`-.->` or it would swallow their leading dashes.
     for (op, kind) in [
         ("-.->", EdgeKind::Dashed),
         ("-->", EdgeKind::Solid),
@@ -165,8 +185,14 @@ fn edge_op(s: &str) -> Option<(EdgeKind, usize)> {
 /// of (from_id, to_id, label, kind) pairs — chains emit consecutive
 /// pairs sharing the middle node.
 fn parse_edges(g: &mut Graph, line: &str, group: &str) {
+    // Cursor walking the line — alternates between node specs and
+    // arrow operators (`A --> B --> C` chains).
     let mut rest = line;
+
+    // The last node seen — becomes `from` when an arrow arrives.
     let mut prev_id: Option<String> = None;
+
+    // A completed arrow awaiting its target — (src, label, kind).
     let mut pending: Option<(String, Vec<String>, EdgeKind)> = None;
 
     loop {
@@ -179,8 +205,11 @@ fn parse_edges(g: &mut Graph, line: &str, group: &str) {
         if let Some((kind, op_len)) = edge_op(rest) {
             // After the arrow an optional |"label"| or |label| follows.
             let mut after = &rest[op_len..];
+
             let mut label: Vec<String> = Vec::new();
 
+            // `|...|` label capture — quoted or bare text to the next
+            // pipe; the cursor resumes after it.
             if let Some(stripped) = after.trim_start().strip_prefix('|') {
                 if let Some(end) = stripped.find('|') {
                     let mut raw = &stripped[..end];
@@ -188,17 +217,23 @@ fn parse_edges(g: &mut Graph, line: &str, group: &str) {
                     if raw.starts_with('"') {
                         raw = &raw[1..];
                     }
+
                     let raw = raw.strip_suffix('"').unwrap_or(raw);
+
                     label = label_lines(raw);
+
                     after = &stripped[end + 1..];
                 }
             }
 
+            // Arrow only counts if a node preceded it — a stray
+            // `--> B` at line start parses as nothing.
             if let Some(src) = prev_id.take() {
                 pending = Some((src, label, kind));
             }
 
             rest = after;
+
             continue;
         }
 
@@ -235,17 +270,22 @@ fn parse_edges(g: &mut Graph, line: &str, group: &str) {
         let bare =
             entry.shape == Shape::Rect && entry.lines.len() == 1 && entry.lines[0] == entry.id;
 
+        // A real shape always wins; a bare restatement only refines
+        // another bare node (never downgrades a shaped one).
         if shape != Shape::Rect || bare {
             entry.lines = lines;
             entry.shape = shape;
         }
 
+        // Group membership — first claim wins; a node declared at top
+        // level then re-mentioned inside a subgraph keeps top level.
         if group.is_empty() && entry.group.is_empty() {
             // top-level stays top-level
         } else if !group.is_empty() && entry.group.is_empty() {
             entry.group = group.to_string();
         }
 
+        // A waiting arrow + this node = a complete edge — emit it.
         if let Some((src, label, kind)) = pending.take() {
             g.edges.push(Edge {
                 from: src,
@@ -255,13 +295,16 @@ fn parse_edges(g: &mut Graph, line: &str, group: &str) {
             });
         }
 
+        // This node becomes the potential source of the next arrow.
         prev_id = Some(id);
+
         rest = &rest[used..];
     }
 }
 
 /// Parses the whole source into a `Graph` IR.
 fn parse(source: &str) -> Graph {
+    // Empty IR — default LR orientation (sign +1, horizontal axis).
     let mut g = Graph {
         horizontal: true,
         sign: 1.0,
@@ -270,11 +313,15 @@ fn parse(source: &str) -> Graph {
         edges: Vec::new(),
         groups: Vec::new(),
     };
+
+    // Nesting tracker — `subgraph` pushes, `end` pops; the current
+    // innermost group owns any node seen next.
     let mut group_stack: Vec<String> = Vec::new();
 
     for (i, raw) in source.lines().enumerate() {
         let line = raw.trim();
 
+        // Blank lines + `%%` mermaid comments carry no semantics.
         if line.is_empty() || line.starts_with("%%") {
             continue;
         }
@@ -287,6 +334,8 @@ fn parse(source: &str) -> Graph {
                 .unwrap_or("TB")
                 .to_ascii_uppercase();
 
+            // Map the word onto (axis, sign): LR/RL horizontal, TD/BT
+            // vertical; R* and B* flip the direction sign.
             match dir.as_str() {
                 "LR" => {}
                 "RL" => g.sign = -1.0,
@@ -300,6 +349,7 @@ fn parse(source: &str) -> Graph {
             continue;
         }
 
+        // `end` closes the innermost subgraph.
         if line == "end" {
             group_stack.pop();
             continue;
@@ -318,6 +368,8 @@ fn parse(source: &str) -> Graph {
                 )
             };
 
+            // Record the cluster (empty label → the id doubles as it)
+            // and push it so following nodes claim membership.
             g.groups.push(Group {
                 id: id.clone(),
                 lines: if label.is_empty() {
@@ -330,7 +382,9 @@ fn parse(source: &str) -> Graph {
                 w: 0.0,
                 h: 0.0,
             });
+
             group_stack.push(id);
+
             continue;
         }
 
@@ -345,6 +399,8 @@ fn parse(source: &str) -> Graph {
             continue;
         }
 
+        // Every remaining line is a node/edge statement — the current
+        // innermost group ("" = top level) owns any nodes it declares.
         let group = group_stack.last().cloned().unwrap_or_default();
 
         parse_edges(&mut g, line, &group);
@@ -398,6 +454,8 @@ fn rank(g: &mut Graph) {
         }
     }
 
+    // Write the converged ranks back onto the nodes — the min() cap
+    // keeps a pathological cyclic input from exceeding V.
     for (i, id) in g.ids.iter().enumerate() {
         if let Some(n) = g.nodes.get_mut(id) {
             n.rank = ranks[i].min(g.ids.len());
@@ -648,23 +706,31 @@ fn layout(g: &mut Graph, theme: &Theme) {
 /// the smaller of the half-extent ratios so it stops at the first
 /// face it would cross.
 fn border(n: &Node, tx: f32, ty: f32) -> (f32, f32) {
+    // Ray from the node center toward the target point.
     let dx = tx - n.x;
+
     let dy = ty - n.y;
 
+    // Degenerate ray (zero length) — return the center unchanged.
     if dx == 0.0 && dy == 0.0 {
         return (n.x, n.y);
     }
 
+    // Scale to hit the vertical faces…
     let sx = if dx != 0.0 {
         (n.w / 2.0) / dx.abs()
     } else {
         f32::MAX
     };
+
+    // …and the horizontal faces; the smaller scale reaches a border
+    // first — that face is the exit point.
     let sy = if dy != 0.0 {
         (n.h / 2.0) / dy.abs()
     } else {
         f32::MAX
     };
+
     let s = sx.min(sy);
 
     (n.x + dx * s, n.y + dy * s)
@@ -703,9 +769,15 @@ fn rects_touch(
 /// without it two labels converging on one node overlap and the first
 /// renders as clipped text ("prob").
 fn chip_free(g: &Graph, placed: &[(f32, f32, f32, f32)], cx: f32, cy: f32, w: f32, h: f32) -> bool {
+    // Two clauses, both must hold: (1) the chip clears every node box
+    // by the full LABEL_CLEAR margin, (2) it clears every already-
+    // placed chip by half that — chips may sit nearer each other than
+    // near nodes since text-on-text is the failure, not adjacency.
     g.nodes.values().all(|n| {
         !rects_touch(cx, cy, w, h, n.x, n.y, n.w, n.h, LABEL_CLEAR)
     }) && placed.iter().all(|&(px0, py0, px1, py1)| {
+        // Placed chips arrive as corner rects — convert to center +
+        // half-extents for the shared rect test.
         !rects_touch(
             cx,
             cy,
@@ -741,8 +813,12 @@ fn label_pos(
     lw: f32,
     lh: f32,
 ) -> (f32, f32) {
+    // The clipped edge endpoints — border→border, not center→center,
+    // so candidates never start inside a node box.
     let (x1, y1) = border(a, b.x, b.y);
+
     let (x2, y2) = border(b, a.x, a.y);
+
     // Alternating offsets around 0.5 so the nearest free spot wins —
     // 0.5 is listed first and is also the fallback.
     const T: [f32; 11] = [0.5, 0.62, 0.38, 0.74, 0.26, 0.86, 0.14, 0.94, 0.06, 0.98, 0.02];
@@ -752,15 +828,26 @@ fn label_pos(
     // small perpendicular step keeps the chip beside its own edge
     // while escaping the pile; 0 first keeps on-edge placement free.
     const LAT: [f32; 7] = [0.0, 18.0, -18.0, 34.0, -34.0, 48.0, -48.0];
+    // Edge direction + its unit perpendicular — candidates slide
+    // along t and sidestep by lat·(px,py).
     let dx = x2 - x1;
+
     let dy = y2 - y1;
+
     let len = (dx * dx + dy * dy).sqrt().max(0.001);
+
     let (px, py) = (-dy / len, dx / len);
+
+    // The true midpoint, captured when the search passes it — the
+    // worst-case fallback if no candidate clears.
     let mut mid = (0.0f32, 0.0f32);
 
+    // Candidate scan: along-edge position × lateral sidestep — first
+    // free spot wins, so nearer-midpoint candidates dominate.
     for t in T {
         for lat in LAT {
             let cx = x1 + dx * t + px * lat;
+
             let cy = y1 + dy * t + py * lat;
 
             if t == 0.5 && lat == 0.0 {
@@ -811,20 +898,29 @@ fn place_labels(g: &Graph, theme: &Theme) -> Vec<Option<(f32, f32)>> {
 
     order.sort_by(|&i, &j| edge_len(i).partial_cmp(&edge_len(j)).unwrap_or(std::cmp::Ordering::Equal));
 
+    // Placement sweep — edges in ascending length order.
     for &i in &order {
         let e = &g.edges[i];
 
+        // Skip the un-placeable: self-loops (their label sits on the
+        // stub) and label-less edges.
         if e.from == e.to || e.label.is_empty() {
             continue;
         }
 
+        // Dangling endpoint references can't place — skip silently.
         let (Some(a), Some(b)) = (g.nodes.get(&e.from), g.nodes.get(&e.to)) else {
             continue;
         };
+
+        // Measure the chip, find a clear spot, claim it for later
+        // collision checks, and record the center for the draw pass.
         let (lw, lh) = svg::label_size(&e.label, theme);
+
         let (cx, cy) = label_pos(g, &placed, a, b, lw, lh);
 
         placed.push((cx - lw / 2.0, cy - lh / 2.0, cx + lw / 2.0, cy + lh / 2.0));
+
         centers[i] = Some((cx, cy));
     }
 
@@ -833,9 +929,15 @@ fn place_labels(g: &Graph, theme: &Theme) -> Vec<Option<(f32, f32)>> {
 
 /// Draws a node shape centered at (n.x, n.y).
 fn draw_node(out: &mut String, n: &Node, theme: &Theme) {
+    // Center-anchored → top-left corner for the rect primitives.
     let x = n.x - n.w / 2.0;
+
     let y = n.y - n.h / 2.0;
+
+    // Escape once — theme strings are CSS values, not markup, but a
+    // stray quote would still break the attribute.
     let stroke = esc(&theme.line);
+
     let fill = esc(&theme.bg);
 
     match n.shape {
@@ -902,13 +1004,18 @@ fn draw_node(out: &mut String, n: &Node, theme: &Theme) {
 
 /// Parses + lays out + emits a flowchart diagram.
 pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
+    // Stage 1 — source → IR.
     let mut g = parse(source);
 
+    // A parse with zero nodes produced no drawable diagram — report
+    // it so the caller falls back to showing the raw source.
     if g.nodes.is_empty() {
         return Err("no nodes parsed".into());
     }
 
+    // Stage 2 — longest-path layering, then measure + place.
     rank(&mut g);
+
     layout(&mut g, theme);
 
     // Label chip centers — computed once (they need the clipped edge
@@ -925,6 +1032,8 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
     let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
     let (mut max_x, mut max_y) = (0.0f32, 0.0f32);
 
+    // Bounds accumulator — folds each painted element's corner rect
+    // into the running min/max.
     let mut grow = |x0: f32, y0: f32, x1: f32, y1: f32| {
         min_x = min_x.min(x0);
         min_y = min_y.min(y0);
@@ -932,6 +1041,7 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
         max_y = max_y.max(y1);
     };
 
+    // Node boxes…
     for n in g.nodes.values() {
         grow(
             n.x - n.w / 2.0,
@@ -940,9 +1050,13 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
             n.y + n.h / 2.0,
         );
     }
+
+    // …cluster boxes…
     for grp in &g.groups {
         grow(grp.x, grp.y, grp.x + grp.w, grp.y + grp.h);
     }
+
+    // …and the edge overshoots (self-loops + label chips).
     for (i, e) in g.edges.iter().enumerate() {
         let (Some(a), Some(_b)) = (g.nodes.get(&e.from), g.nodes.get(&e.to)) else {
             continue;
@@ -958,23 +1072,33 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
             continue;
         }
 
+        // Unlabeled edges paint nothing beyond their line — skip.
         if e.label.is_empty() {
             continue;
         }
 
+        // No placed center (e.g. missing endpoint) — nothing to fold.
         let Some((mx, my)) = label_centers[i] else {
             continue;
         };
+
         let (lw, lh) = svg::label_size(&e.label, theme);
 
         grow(mx - lw / 2.0, my - lh / 2.0, mx + lw / 2.0, my + lh / 2.0);
     }
 
+    // viewBox = painted bounds + margin on every side; the origin can
+    // legitimately be negative (see `svg::open`).
     let w = max_x - min_x + MARGIN * 2.0;
+
     let h = max_y - min_y + MARGIN * 2.0;
+
     let origin_x = min_x - MARGIN;
+
     let origin_y = min_y - MARGIN;
 
+    // Pre-size the output — ~200 B per edge is the observed emitter
+    // cost; one realloc avoided at corpus scale.
     let mut out = String::with_capacity(4096 + g.edges.len() * 200);
 
     svg::open(&mut out, origin_x, origin_y, w, h);
@@ -1022,7 +1146,10 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
             continue;
         }
 
+        // Regular edge — clipped to both node borders so the line and
+        // arrowhead stop at the outline.
         let (x1, y1) = border(a, b.x, b.y);
+
         let (x2, y2) = border(b, a.x, a.y);
 
         svg::edge_line(
@@ -1036,15 +1163,18 @@ pub fn render(source: &str, theme: &Theme) -> Result<String, String> {
             theme,
         );
 
+        // Open edges (`---`) get no head; all others do.
         if e.kind != EdgeKind::Open {
             svg::arrow_head(&mut out, x2, y2, x2 - x1, y2 - y1, theme);
         }
 
+        // The pre-placed label chip, if this edge has one.
         if let Some((mx, my)) = label_centers[i] {
             svg::label_chip(&mut out, mx, my, &e.label, theme);
         }
     }
 
+    // Nodes last — topmost paint layer.
     for n in g.nodes.values() {
         draw_node(&mut out, n, theme);
     }
@@ -1061,6 +1191,8 @@ mod tests {
     /// Neutral theme for layout tests — colors are irrelevant to the
     /// geometry under test; font size drives all box measurements.
     fn theme() -> Theme {
+        // Literal hexes are fine here — this is test vocabulary, not
+        // shipped styling; only the metrics matter to layout.
         Theme {
             font: "sans-serif".into(),
             font_size: 14.0,
@@ -1091,6 +1223,9 @@ mod tests {
     fn placed_labels(g: &Graph, theme: &Theme) -> Vec<((f32, f32), (f32, f32), String)> {
         let centers = place_labels(g, theme);
 
+        // Zip centers with their edges — skipping unlabeled/self edges
+        // (None centers) and tagging each with a readable "A -> B"
+        // name for failure messages.
         g.edges
             .iter()
             .enumerate()
@@ -1113,6 +1248,8 @@ mod tests {
 
         let labels = placed_labels(&g, &theme);
 
+        // Every placed chip must clear every node box by LABEL_CLEAR —
+        // the primary collision contract.
         for ((cx, cy), (lw, lh), edge) in &labels {
             assert!(
                 g.nodes.values().all(|n| !rects_touch(
@@ -1135,6 +1272,8 @@ mod tests {
 
         let labels = placed_labels(&g, &theme);
 
+        // Pairwise all-pairs check — chips may not touch each other
+        // either (the second would paint over the first's text).
         for (i, ((ax, ay), (aw, ah), ea)) in labels.iter().enumerate() {
             for ((bx, by), (bw, bh), eb) in labels.iter().skip(i + 1) {
                 assert!(

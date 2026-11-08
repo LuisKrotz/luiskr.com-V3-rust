@@ -48,7 +48,12 @@ use wasm_bindgen::prelude::*;
 /// devWarn while restoring the source block (fail-soft contract).
 #[wasm_bindgen]
 pub fn render_diagram(source: &str, theme_json: &str) -> Result<String, JsValue> {
+    // Decode the theme first — every emitter pulls palette/metrics
+    // from it; malformed JSON yields the neutral fallback inside.
     let theme = model::Theme::from_json(theme_json);
+
+    // Family dispatch key — mermaid puts the diagram type as the
+    // first whitespace-delimited word of the fence body.
     let head = source
         .split_whitespace()
         .next()

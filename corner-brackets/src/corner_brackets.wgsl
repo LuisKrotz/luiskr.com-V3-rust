@@ -7,13 +7,13 @@
 // awards-carousel/_selected.scss, _explore.scss):
 //
 //   rest   — each corner is a square box ($space-md), so each arm's
-//            length = arm0 (the stub).
+//            length = arm_rest (the stub).
 //   hover  — the box grows to calc(100% − inset) in BOTH axes, so the
 //            TL bracket's top arm spans the whole top edge and its
 //            left arm the whole left edge (the BR bracket mirrors);
-//            arm1 carries the resolved device-px spans pushed by JS,
-//            over 0.25s — the JS side drives the eased `hover` scalar
-//            so the shader stays stateless.
+//            arm_hover carries the resolved device-px spans pushed by
+//            JS, over 0.25s — the JS side drives the eased `hover`
+//            scalar so the shader stays stateless.
 //   tint   — the border color is uniform per surface (edge color);
 //            `accent` carries the hover tint for surfaces that use it
 //            (the CSS variants animate border-color on some buttons).
@@ -23,88 +23,106 @@
 // fragment is lit inside ANY arm band — the mask is a union of 4
 // axis-aligned slabs, min-distance, antialiased ~1px.
 //
+// The vertex stage is a CUSTOM fullscreen triangle that also projects
+// device-px frag coords (the arm math is pixel-native), so this file
+// composes with the gpu-mini helpers prelude, not the shared vs_main.
+//
 // Uniform layout (f32s=16 — lib.rs doc):
-//   [0,1] res · [2] hover · [3] hair · [4,5] arm0 (w,h) ·
-//   [6,7] arm1 (w,h) · [8..12) edge rgba · [12..16) accent rgba
+//   [0,1] resolution_dev · [2] hover_amount · [3] hairline_half ·
+//   [4,5] arm_rest (w,h) · [6,7] arm_hover (w,h) ·
+//   [8..12) edge_rgba · [12..16) accent_rgba
 
-struct U {
-    res    : vec2<f32>,
-    hover  : f32,
-    hair   : f32,
-    arm0   : vec2<f32>,
-    arm1   : vec2<f32>,
-    edge   : vec4<f32>,
-    accent : vec4<f32>,
+struct Uniforms {
+    resolution_dev: vec2<f32>,
+    hover_amount: f32,
+    hairline_half: f32,
+    arm_rest: vec2<f32>,
+    arm_hover: vec2<f32>,
+    edge_rgba: vec4<f32>,
+    accent_rgba: vec4<f32>,
 };
 
-@group(0) @binding(0) var<uniform> u : U;
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
-struct Out {
-    @builtin(position) clip : vec4<f32>,
-    @location(0) frag       : vec2<f32>,   // device-px position
+// ── Tunables ─────────────────────────────────────────────────────────
+
+// Band thickness = hairline half-width × 2 (both arms).
+const BAND_THICKNESS_MULT: f32 = 2.0;
+// The arm-mask AA — a ~1px soft edge so the brackets don't shimmer.
+const ARM_AA_PX: f32 = 1.0;
+// Pixels this faint are culled before the tint mix.
+const LIVE_EPSILON: f32 = 0.001;
+
+struct VertexOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) pixel_px: vec2<f32>,   // device-px position
 };
 
 /// `vs_main` — fullscreen triangle: 3 verts → clip positions
-/// (−1,−1) (3,−1) (−1,3); frag carries device-px for the SDF.
+/// (−1,−1) (3,−1) (−1,3); `pixel_px` carries the device-px position
+/// (the triangle's clip coords un-projected into the canvas domain —
+/// off-canvas verts land outside 0..res and are clipped by the
+/// rasterizer, which is exactly what the fullscreen triangle wants).
 @vertex
-fn vs_main(@builtin(vertex_index) v : u32) -> Out {
-    var out : Out;
-    var pos = vec2<f32>(-1.0, -1.0);
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
+    var output: VertexOut;
+    var clip_xy = vec2<f32>(-1.0, -1.0);
 
-    if (v == 1u) {
-        pos = vec2<f32>(3.0, -1.0);
-    } else if (v == 2u) {
-        pos = vec2<f32>(-1.0, 3.0);
+    if (vertex_index == 1u) {
+        clip_xy = vec2<f32>(3.0, -1.0);
+    } else if (vertex_index == 2u) {
+        clip_xy = vec2<f32>(-1.0, 3.0);
     }
 
-    out.clip = vec4<f32>(pos, 0.0, 1.0);
-    out.frag = vec2<f32>(
-        (pos.x + 1.0) * 0.5 * u.res.x,
-        (1.0 - pos.y) * 0.5 * u.res.y,
+    output.position = vec4<f32>(clip_xy, 0.0, 1.0);
+    output.pixel_px = vec2<f32>(
+        (clip_xy.x + 1.0) * 0.5 * uniforms.resolution_dev.x,
+        (1.0 - clip_xy.y) * 0.5 * uniforms.resolution_dev.y,
     );
 
-    return out;
+    return output;
 }
 
-/// `slab` — distance outside an axis-aligned band: how far `p` is
-/// from the rectangle [lo.x,hi.x]×[lo.y,hi.y]. `max`-of-axis-excess
-/// collapses to ≤0 inside — the arm union is `min` over the 8 slabs.
-fn slab(p : vec2<f32>, lo : vec2<f32>, hi : vec2<f32>) -> f32 {
-    let e = max(lo - p, p - hi);
+/// `slab_distance` — distance outside an axis-aligned band: how far
+/// `point` is from the rectangle [lo.x,hi.x]×[lo.y,hi.y]. `max`-of-
+/// axis-excess collapses to ≤0 inside — the arm union is `min` over
+/// the 4 slabs.
+fn slab_distance(point: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>) -> f32 {
+    let excess = max(lo - point, point - hi);
 
-    return max(e.x, e.y);
+    return max(excess.x, excess.y);
 }
 
 /// `fs_main` — the 4-slab union × tint, ~1px-antialiased.
 @fragment
-fn fs_main(v : Out) -> @location(0) vec4<f32> {
-    let p = v.frag;
-    let aw = mix(u.arm0.x, u.arm1.x, u.hover);   // box width  (arm x)
-    let ah = mix(u.arm0.y, u.arm1.y, u.hover);   // box height (arm y)
-    let hw = u.hair * 2.0;                        // band thickness
+fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    let pixel = input.pixel_px;
+    let arm_w = mix(uniforms.arm_rest.x, uniforms.arm_hover.x, uniforms.hover_amount); // box width (arm x)
+    let arm_h = mix(uniforms.arm_rest.y, uniforms.arm_hover.y, uniforms.hover_amount); // box height (arm y)
+    let band = uniforms.hairline_half * BAND_THICKNESS_MULT;                            // band thickness
 
     // The 4 arms — TL bracket (border-top + border-left) and BR
     // bracket (border-bottom + border-right), flush with the rect
     // edges exactly like the pseudo-elements' `top/left/bottom/right:0`:
     //
-    //   TL: top band   [0,aw]·[0,hw]    +  left band   [0,hw]·[0,ah]
-    //   BR: bottom band [w−aw,w]·[h−hw,h] + right band [w−hw,w]·[h−ah,h]
-    let w = u.res.x;
-    let h = u.res.y;
+    //   TL: top band    [0,arm_w]·[0,band]  +  left band  [0,band]·[0,arm_h]
+    //   BR: bottom band [w−arm_w,w]·[h−band,h] + right band [w−band,w]·[h−arm_h,h]
+    let width = uniforms.resolution_dev.x;
+    let height = uniforms.resolution_dev.y;
 
-    var d =    slab(p, vec2<f32>(0.0,     0.0),     vec2<f32>(aw, hw));
-    d = min(d, slab(p, vec2<f32>(0.0,     0.0),     vec2<f32>(hw, ah)));
-    d = min(d, slab(p, vec2<f32>(w - aw,  h - hw),  vec2<f32>(w,  h)));
-    d = min(d, slab(p, vec2<f32>(w - hw,  h - ah),  vec2<f32>(w,  h)));
+    var dist =    slab_distance(pixel, vec2<f32>(0.0,        0.0),          vec2<f32>(arm_w, band));
+    dist = min(dist, slab_distance(pixel, vec2<f32>(0.0,        0.0),          vec2<f32>(band, arm_h)));
+    dist = min(dist, slab_distance(pixel, vec2<f32>(width - arm_w, height - band), vec2<f32>(width, height)));
+    dist = min(dist, slab_distance(pixel, vec2<f32>(width - band,  height - arm_h), vec2<f32>(width, height)));
 
-    let mask = 1.0 - smoothstep(-1.0, 1.0, d);
+    let arm_mask = 1.0 - smoothstep(-ARM_AA_PX, ARM_AA_PX, dist);
 
-    if (mask <= 0.001) {
+    if (arm_mask <= LIVE_EPSILON) {
         discard;
     }
 
-    let col = mix(u.edge, u.accent, u.hover);
-    let a = col.a * mask;
+    let tint = mix(uniforms.edge_rgba, uniforms.accent_rgba, uniforms.hover_amount);
+    let alpha = tint.a * arm_mask;
 
-    return vec4<f32>(col.rgb * a, a);
+    return vec4<f32>(tint.rgb * alpha, alpha);
 }

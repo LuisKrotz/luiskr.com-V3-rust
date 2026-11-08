@@ -35,14 +35,22 @@ const P_MAX: usize = 110;
 const SPAWN_PER_S: f32 = 90.0;
 /// Fraction of spawns that are dark char flecks.
 const CHAR_FRACTION: f32 = 0.3;
+/// Ember lifetime bounds (s) — short-lived sparks.
 const EMBER_LIFE_MIN: f32 = 0.35;
 const EMBER_LIFE_MAX: f32 = 0.9;
+/// Char-fleck lifetime bounds (s) — heavier scraps linger a touch
+/// longer than sparks.
 const FLECK_LIFE_MIN: f32 = 0.5;
 const FLECK_LIFE_MAX: f32 = 1.1;
+/// Fleck launch speeds + gravity (px/s, px/s²) — flecks pop off the
+/// front then tumble under gravity.
 const FLECK_VY: f32 = 46.0;
 const FLECK_VX: f32 = 22.0;
 const FLECK_G: f32 = 60.0;
+/// Rebuild-mode deposit fall speed (px/s) — gentle rain onto the
+/// climbing re-ink edge.
 const DEPOSIT_VY: f32 = 18.0;
+/// Fleck size spread added to the 1 px base (device px).
 const FLECK_SIZE: f32 = 3.4;
 
 // ── Real-fire ember model ───────────────────────────────────────────
@@ -90,6 +98,7 @@ const EMBER_SIZE: f32 = 2.2;
 // second. Rendered through the soft-eroded puff path with a hot core.
 /// Lick spawn rate along the live front (/s).
 const FLAME_PER_S: f32 = 55.0;
+/// Lick lifetime bounds (s) — tongues live for tenths of a second.
 const FLAME_LIFE_MIN: f32 = 0.14;
 const FLAME_LIFE_MAX: f32 = 0.34;
 /// Lick launch speed — flame gas rises fast near the reaction zone.
@@ -114,6 +123,8 @@ const FLAME_MAX: usize = 90;
 /// Smoke puffs per second along the live front — far sparser than
 /// embers; each puff is large and long-lived.
 const SMOKE_PER_S: f32 = 12.0;
+/// Puff lifetime bounds (s) — the plume outlives the sparks by
+/// several seconds.
 const SMOKE_LIFE_MIN: f32 = 1.8;
 const SMOKE_LIFE_MAX: f32 = 3.2;
 /// Initial buoyant velocity (upward, px/s) at the hot front.
@@ -155,11 +166,15 @@ const EXTINCT_S: f32 = 0.55;
 /// One letter's burn unit — rect in paper px + speed + ignition delay.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Letter {
+    /// Paper-px rect the letter occupies (x0,y0 top → x1,y1 bottom).
     x0: f32,
     y0: f32,
     x1: f32,
     y1: f32,
+    /// Burn speed — the front crosses this letter's height at `v` per
+    /// unit of global progress.
     v: f32,
+    /// Ignition delay — global progress before this letter starts.
     delay: f32,
 }
 
@@ -167,17 +182,23 @@ pub(crate) struct Letter {
 /// plus the thermal/plume state the real-fire model needs.
 #[derive(Clone, Copy)]
 pub(crate) struct Particle {
+    /// Canvas CSS-px position (top-left origin, +y down).
     pub(crate) x: f32,
     pub(crate) y: f32,
+    /// Velocity px/s — vy < 0 climbs (the paper burns upward).
     pub(crate) vx: f32,
     pub(crate) vy: f32,
+    /// Elapsed life / allocated lifetime (s).
     pub(crate) life: f32,
     pub(crate) max_life: f32,
+    /// Quad diameter in device px (smoke also: current plume width).
     pub(crate) size: f32,
     /// 0 = ember, 1 = char fleck, 2 = smoke puff, 3 = flame lick.
     pub(crate) kind: u8,
+    /// Rotation (rad) + spin rate (rad/s) — the erosion mask's driver.
     pub(crate) rot: f32,
     pub(crate) spin: f32,
+    /// Per-particle noise phase — desynchronizes wobble/flicker.
     pub(crate) phase: f32,
     /// Particle temperature (K) — embers/flecks cool toward ambient;
     /// smoke uses this slot as the puff's birth diameter instead.
@@ -280,6 +301,9 @@ fn heat_ramp(
 impl BurnSim {
     /// Fresh session — deterministic seed; dir ∈ {+1, −1}.
     pub fn new(dir: f32, origin: [f32; 2], seed: u32) -> BurnSim {
+        // Fresh session: pools pre-sized to their caps (no mid-burn
+        // realloc), tints zeroed until `set_colors` lands, xorshift
+        // seeded odd (state 0 would fix the stream at 0 forever).
         BurnSim {
             particles: Vec::with_capacity(P_MAX),
             letters: Vec::new(),
@@ -304,7 +328,10 @@ impl BurnSim {
     /// Per-frame stage push — the bridge forwards global progress +
     /// jagged amplitude before `frame`, so `tick` needs no parameters.
     pub fn set_stage(&mut self, stage: f32, jag_amp: f32) {
+        // Store both verbatim — `tick` consumes them parameter-free so
+        // the bridge's per-frame push stays a plain setter.
         self.stage = stage;
+
         self.jag_amp = jag_amp;
     }
 
@@ -313,15 +340,21 @@ impl BurnSim {
     /// counts too: the plume outlives the sparks by seconds, so a
     /// sparks-only check would cut the session mid-dissipation.
     pub fn live_count(&self) -> usize {
+        // All three pools — sparks + plume + flame band.
         self.particles.len() + self.smoke.len() + self.flames.len()
     }
 
     /// xorshift32 → [0,1) — the JS sim called Math.random() per particle;
     /// here the stream is deterministic so replays are bit-identical.
     fn rnd(&mut self) -> f32 {
+        // Marsaglia xorshift32 — three shift/xor rounds…
         self.rng ^= self.rng << 13;
+
         self.rng ^= self.rng >> 17;
+
         self.rng ^= self.rng << 5;
+
+        // …then normalize the u32 state into [0,1).
         (self.rng as f32) / (u32::MAX as f32)
     }
 
@@ -329,6 +362,7 @@ impl BurnSim {
     /// mirrored DOM rect moves, so a scrolling/resizing tile drags its
     /// flame front and letter field along instead of burning in place.
     pub fn set_origin(&mut self, origin: [f32; 2]) {
+        // Store the new anchor — every emit offsets by it next tick.
         self.origin = origin;
     }
 
@@ -336,16 +370,26 @@ impl BurnSim {
     /// restarts the particle stream, matching the JS session's hover-out.
     /// Re-inking paper doesn't smoke, so the plume clears too.
     pub fn set_dir(&mut self, dir: f32) {
+        // Flip the mode and drain every pool — a burn's sparks can't
+        // become a rebuild's deposits mid-flight.
         self.dir = dir;
+
         self.particles.clear();
+
         self.smoke.clear();
+
         self.flames.clear();
+
+        // Reset fuel starvation — the flipped session starts fed.
         self.extinct = 0.0;
     }
 
     /// Replaces the letter table — called at session mount only.
     pub fn set_letters(&mut self, flat: &[f32]) {
+        // Rebuild the table wholesale — mount-only, so no incremental
+        // path exists. chunks_exact drops any malformed tail.
         self.letters.clear();
+
         self.letters.extend(flat.chunks_exact(6).map(|c| Letter {
             x0: c[0],
             y0: c[1],
@@ -358,16 +402,20 @@ impl BurnSim {
 
     /// Replaces the per-column ink bitmap.
     pub fn set_ink(&mut self, ink: &[u8]) {
+        // Rebuild the column-occupancy bitmap wholesale.
         self.col_ink.clear();
+
         self.col_ink.extend_from_slice(ink);
     }
 
     /// Sets the four ink tints — [core, mid, edge, scorch] × rgba.
     pub fn set_colors(&mut self, flat: &[f32]) {
+        // Copy helper — pulls rgba record `i` out of the flat table.
         let take = |i: usize, out: &mut [f32; 4]| {
             out.copy_from_slice(&flat[i * 4..i * 4 + 4]);
         };
 
+        // The four ember-ramp tints — the thermal ramp's anchors.
         if flat.len() >= 16 {
             take(0, &mut self.ink_core);
             take(1, &mut self.ink_mid);
@@ -375,6 +423,7 @@ impl BurnSim {
             take(3, &mut self.ink_scorch);
         }
 
+        // Optional fifth tint — the smoke plume's grey.
         if flat.len() >= 20 {
             take(4, &mut self.ink_smoke);
         } else if flat.len() >= 16 {
@@ -396,71 +445,107 @@ impl BurnSim {
     /// Associated fn (no `&self`) so callers under a `&mut self.particles`
     /// borrow can still evaluate it — `t` arrives as a captured local.
     fn front_y(t: f32, l: &Letter, x: f32, progress: f32, jag_amp: f32) -> f32 {
+        // This letter's own 0..1 burn — speed + ignition delay applied.
         let p = letter_progress(l, progress);
 
+        // Fully consumed → no live front; −1 signals "dead letter".
         if p >= 1.0 {
             return -1.0;
         }
 
+        // Total climb distance — letter height plus the jagged band's
+        // overshoot on both ends so the edge exits fully.
         let travel = l.y1 - l.y0 + jag_amp * 2.0;
 
+        // Front y: start below the letter bottom (y1 + jag), climb by
+        // progress, wobble on the deterministic edge noise.
         l.y1 + jag_amp - p * travel + edge_noise(x, t * 3.0) * jag_amp
     }
 
     /// Spawns along live fronts — probabilistic gating keeps the rate
     /// fractional (particles.ts `spawn`), deposits invert for rebuild.
     fn spawn(&mut self, progress: f32, jag_amp: f32, dt: f32) {
+        // Poisson rate → fractional per-frame quota…
         let want = SPAWN_PER_S * dt;
+
         let rebuild = self.dir < 0.0;
+
         let n_letters = self.letters.len();
 
+        // No letter table yet (pre-mount) → nothing to spawn on.
         if n_letters == 0 {
             return;
         }
 
+        // …walked off one unit at a time, each gated by a coin flip
+        // (rnd > remaining quota → skip) so fractional rates emit
+        // stochastically instead of flooring to 0 at high fps.
         let mut i = 0.0;
 
         while i < want {
+            // Fractional-quota gate — the probabilistic half of the
+            // Poisson process.
             if self.rnd() > want - i {
                 i += 1.0;
                 continue;
             }
 
+            // Pool cap — a saturated field just stops spawning.
             if self.particles.len() >= P_MAX {
                 return;
             }
 
+            // Pick a letter, then a column inside its rect…
             let li = (self.rnd() * n_letters as f32) as usize;
+
             let l = self.letters[li.min(n_letters - 1)];
+
             let xp = (l.x0 + self.rnd() * (l.x1 - l.x0)).round() as usize;
 
+            // …which must carry ink — sparks only exist where the
+            // glyph's paper still is.
             if xp >= self.col_ink.len() || self.col_ink[xp] == 0 {
                 i += 1.0;
                 continue;
             }
 
+            // The live front's y at that column (−1 = letter dead).
             let fy = Self::front_y(self.t, &l, xp as f32, progress, jag_amp);
 
+            // Front must be inside the letter's band (±jag overshoot)
+            // — a dead/departed front spawns nothing.
             if fy < l.y0 - jag_amp || fy > l.y1 + jag_amp {
                 i += 1.0;
                 continue;
             }
 
+            // Emit position: burn sparks ride the front line; rebuild
+            // deposits rain anywhere ABOVE it (the re-ink zone).
             let zone_top = l.y0 - jag_amp;
+
             let x = self.origin[0] + xp as f32;
+
             let y = if rebuild {
                 self.origin[1] + zone_top + self.rnd() * (fy - zone_top).max(0.0)
             } else {
                 self.origin[1] + fy
             };
 
+            // Particle kind — CHAR_FRACTION of spawns are dark flecks.
             let fleck = self.rnd() < CHAR_FRACTION;
+
+            // Lifetime draw — flecks and embers have separate tables.
             let max_life = if fleck {
                 FLECK_LIFE_MIN + self.rnd() * (FLECK_LIFE_MAX - FLECK_LIFE_MIN)
             } else {
                 EMBER_LIFE_MIN + self.rnd() * (EMBER_LIFE_MAX - EMBER_LIFE_MIN)
             };
+
+            // Lateral launch — symmetric ± spread, per-kind bound.
             let vx = (self.rnd() * 2.0 - 1.0) * if fleck { FLECK_VX } else { EMBER_VX };
+
+            // Vertical launch — rebuild deposits drift DOWN; burn
+            // ejecta climbs (negative vy = up in this space).
             let vy = if rebuild {
                 self.rnd() * DEPOSIT_VY
             } else if fleck {
@@ -476,9 +561,15 @@ impl BurnSim {
             } else {
                 0.8 + self.rnd() * EMBER_SIZE
             };
+
+            // Rotation + tumble spin — flecks read as tumbling scraps.
             let rot = self.rnd() * std::f32::consts::TAU;
+
             let spin = (self.rnd() * 2.0 - 1.0) * 6.0;
+
+            // Noise phase — desynchronizes this mote's wobble.
             let phase = self.rnd() * std::f32::consts::TAU;
+
             // Ejecta temperature — flecks are thin char (cool fast, dim
             // edge), embers leave the reaction zone near-white-hot.
             let temp = if fleck {
@@ -512,33 +603,45 @@ impl BurnSim {
     /// Smoke spawn — same front-gating as sparks but its own rate and
     /// pool. Burn mode only: a re-inking front emits no smoke.
     fn spawn_smoke(&mut self, progress: f32, jag_amp: f32, dt: f32) {
+        // Rebuild mode and pre-mount both skip — re-inking emits no
+        // plume, and no letter table means no front to ride.
         if self.dir < 0.0 || self.letters.is_empty() {
             return;
         }
 
+        // Same Poisson quota walk as the spark spawner.
         let want = SMOKE_PER_S * dt;
+
         let n_letters = self.letters.len();
+
         let mut i = 0.0;
 
         while i < want {
+            // Fractional-quota gate.
             if self.rnd() > want - i {
                 i += 1.0;
                 continue;
             }
 
+            // Plume pool cap.
             if self.smoke.len() >= SMOKE_MAX {
                 return;
             }
 
+            // Letter + column pick…
             let li = (self.rnd() * n_letters as f32) as usize;
+
             let l = self.letters[li.min(n_letters - 1)];
+
             let xp = (l.x0 + self.rnd() * (l.x1 - l.x0)).round() as usize;
 
+            // …ink-gated like the sparks (smoke only off real paper).
             if xp >= self.col_ink.len() || self.col_ink[xp] == 0 {
                 i += 1.0;
                 continue;
             }
 
+            // Front must be live inside the letter band.
             let fy = Self::front_y(self.t, &l, xp as f32, progress, jag_amp);
 
             if fy < l.y0 - jag_amp || fy > l.y1 + jag_amp {
@@ -551,12 +654,24 @@ impl BurnSim {
             // the charring line rather than inside the flame band.
             let y = self.origin[1] + fy - self.rnd() * 6.0;
 
+            // Hot launch upward — the plume decelerates onto its
+            // terminal-drift curve in `tick`.
             let vy = -(SMOKE_VY_MIN + self.rnd() * (SMOKE_VY_MAX - SMOKE_VY_MIN));
+
             let vx = (self.rnd() * 2.0 - 1.0) * SMOKE_VX;
+
+            // Long-lived puff — seconds, not tenths.
             let max_life = SMOKE_LIFE_MIN + self.rnd() * (SMOKE_LIFE_MAX - SMOKE_LIFE_MIN);
+
+            // Birth diameter ±30% — stored in `temp` below because the
+            // entrainment law needs d0 every frame.
             let size = SMOKE_SIZE0 * (0.7 + self.rnd() * 0.6);
+
+            // Erosion rotation + slow spin + noise phase.
             let rot = self.rnd() * std::f32::consts::TAU;
+
             let spin = (self.rnd() * 2.0 - 1.0) * SMOKE_SPIN;
+
             let phase = self.rnd() * std::f32::consts::TAU;
 
             self.smoke.push(Particle {
@@ -587,33 +702,44 @@ impl BurnSim {
     /// tongues born AT the burn front, racing up on strong buoyancy.
     /// Burn mode only; the front gates identically to the sparks.
     fn spawn_flames(&mut self, progress: f32, jag_amp: f32, dt: f32) {
+        // Burn mode + mounted letters only — same gates as smoke.
         if self.dir < 0.0 || self.letters.is_empty() {
             return;
         }
 
+        // Same Poisson quota walk as the other two spawners.
         let want = FLAME_PER_S * dt;
+
         let n_letters = self.letters.len();
+
         let mut i = 0.0;
 
         while i < want {
+            // Fractional-quota gate.
             if self.rnd() > want - i {
                 i += 1.0;
                 continue;
             }
 
+            // Flame-band pool cap.
             if self.flames.len() >= FLAME_MAX {
                 return;
             }
 
+            // Letter + column pick…
             let li = (self.rnd() * n_letters as f32) as usize;
+
             let l = self.letters[li.min(n_letters - 1)];
+
             let xp = (l.x0 + self.rnd() * (l.x1 - l.x0)).round() as usize;
 
+            // …ink-gated (licks only root on live paper).
             if xp >= self.col_ink.len() || self.col_ink[xp] == 0 {
                 i += 1.0;
                 continue;
             }
 
+            // Front must be live inside the letter band.
             let fy = Self::front_y(self.t, &l, xp as f32, progress, jag_amp);
 
             if fy < l.y0 - jag_amp || fy > l.y1 + jag_amp {
@@ -624,13 +750,24 @@ impl BurnSim {
             let x = self.origin[0] + xp as f32;
             // Licks root on the front and immediately peel upward.
             let y = self.origin[1] + fy - self.rnd() * 3.0;
+            // Strong upward launch — flame gas races off the front.
             let vy = -(FLAME_VY_MIN + self.rnd() * (FLAME_VY_MAX - FLAME_VY_MIN));
+
             let vx = (self.rnd() * 2.0 - 1.0) * FLAME_VX;
+
+            // Tenths-of-a-second tongue life.
             let max_life = FLAME_LIFE_MIN + self.rnd() * (FLAME_LIFE_MAX - FLAME_LIFE_MIN);
+
+            // Elongated tongue birth size.
             let size = FLAME_SIZE_MIN + self.rnd() * (FLAME_SIZE_MAX - FLAME_SIZE_MIN);
+
+            // Erosion rotation + spin + noise phase.
             let rot = self.rnd() * std::f32::consts::TAU;
+
             let spin = (self.rnd() * 2.0 - 1.0) * 3.0;
+
             let phase = self.rnd() * std::f32::consts::TAU;
+
             // Flame gas sits near reaction-zone temperature.
             let temp = 1600.0 + self.rnd() * 500.0;
 
@@ -659,6 +796,9 @@ impl BurnSim {
     /// Any letter still burning — the extinction ramp starts the frame
     /// every glyph's front has passed its ink top (fuel starvation).
     fn fronts_alive(&self) -> bool {
+        // Any letter whose own burn hasn't reached 1.0 still feeds
+        // the fire — the first frame ALL are consumed, starvation
+        // begins.
         self.letters
             .iter()
             .any(|l| letter_progress(l, self.stage) < 1.0)
@@ -671,9 +811,15 @@ impl BurnSim {
     /// state arrives via `set_stage` each frame. Emits into `quads` —
     /// one instanced draw for all live particles.
     pub fn tick(&mut self, dt: f32, quads: &mut Vec<f32>) {
+        // Snapshot the pushed stage/amplitude into locals — the emit
+        // loops below can't touch `self` while a `&mut` borrow of a
+        // pool is live.
         let stage = self.stage;
+
         let jag_amp = self.jag_amp;
 
+        // Advance the session clock — drives edge noise and every
+        // particle's wobble/flicker phase.
         self.t += dt;
         // `stage` climbs 0→1 in both directions (JS pushes 1−prog on
         // rebuild) — the same value the landing checks use below. The
@@ -712,8 +858,15 @@ impl BurnSim {
         // ── Smoke plume — emits FIRST: the translucent column sits
         // behind flame and sparks in painter order, matching how a
         // real fire reads (bright motes in front of the ash column).
+        // Hoist the session clock + tint into locals — the loop body
+        // borrows `self.smoke` mutably, so `self` reads must happen
+        // outside it.
         let t = self.t;
+
         let ink_smoke = self.ink_smoke;
+
+        // Backward walk + swap_remove — the classic removal-safe
+        // iteration: dying puffs swap with the tail and drop.
         let mut i = self.smoke.len();
 
         while i > 0 {
@@ -723,6 +876,8 @@ impl BurnSim {
 
             p.life += dt;
 
+            // Expired → swap with the tail and drop (order within the
+            // pool doesn't matter — painter order is per-pool).
             if p.life >= p.max_life {
                 self.smoke.swap_remove(i);
                 continue;
@@ -791,10 +946,17 @@ impl BurnSim {
         // ── Flame licks — the fire's visible sheet. Short-lived tall
         // tongues riding hard buoyancy; they emit between plume and
         // sparks so the flame band glows through its own smoke.
+        // Same hoisted-reads pattern — all four ramp anchors are
+        // needed to tint each lick by its life fraction.
         let ink_scorch = self.ink_scorch;
+
         let ink_edge = self.ink_edge;
+
         let ink_mid = self.ink_mid;
+
         let ink_core = self.ink_core;
+
+        // Backward walk + swap_remove — same removal-safe idiom.
         let mut i = self.flames.len();
 
         while i > 0 {
@@ -804,6 +966,7 @@ impl BurnSim {
 
             p.life += dt;
 
+            // Expired tongue → swap-drop.
             if p.life >= p.max_life {
                 self.flames.swap_remove(i);
                 continue;
@@ -859,8 +1022,14 @@ impl BurnSim {
             ]);
         }
 
+        // Hoist mode + origin — the landing test below reads
+        // `self.letters`/`self.origin` which can't happen inside the
+        // `&mut self.particles` borrow.
         let rebuild = self.dir < 0.0;
+
         let origin = self.origin;
+
+        // Backward walk + swap_remove — same removal-safe idiom.
         let mut i = self.particles.len();
 
         while i > 0 {
@@ -872,11 +1041,13 @@ impl BurnSim {
 
             p.life += dt;
 
+            // Expired → swap-drop.
             if p.life >= p.max_life {
                 self.particles.swap_remove(i);
                 continue;
             }
 
+            // Normalized life fraction — drives envelopes and tints.
             let k = p.life / p.max_life;
 
             if p.kind == 0 {
@@ -951,9 +1122,15 @@ impl BurnSim {
                     continue;
                 }
 
+                // Rebuild landing test — a deposit dies when it falls
+                // to/below its letter's live front (paper-space x is
+                // px − origin).
                 let letter = p.letter;
+
                 let px = p.x;
+
                 let py = p.y;
+
                 let landed = rebuild
                     && letter != u32::MAX
                     && py
@@ -966,12 +1143,18 @@ impl BurnSim {
                                 jag_amp,
                             );
 
+                // Touched down → merge into the paper, drop the mote.
                 if landed {
                     self.particles.swap_remove(i);
                     continue;
                 }
 
+                // Oxidation flicker — the same shimmer the burn path
+                // uses, driven off the particle's own phase.
                 let flick = 0.55 + 0.45 * (p.phase + t * 31.0).sin();
+
+                // Life-fraction ramp — deposits cool core→mid→edge as
+                // they fall.
                 let tint = if k < 0.35 {
                     ink_core
                 } else if k < 0.7 {
@@ -1005,9 +1188,13 @@ impl BurnSim {
                 p.y += p.vy * dt;
                 p.rot += p.spin * dt;
 
+                // Same rebuild landing test as the deposit arm above.
                 let letter = p.letter;
+
                 let px = p.x;
+
                 let py = p.y;
+
                 let landed = rebuild
                     && letter != u32::MAX
                     && py
@@ -1020,6 +1207,7 @@ impl BurnSim {
                                 jag_amp,
                             );
 
+                // Touched down → merge into the paper, drop the fleck.
                 if landed {
                     self.particles.swap_remove(i);
                     continue;

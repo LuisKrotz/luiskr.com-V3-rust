@@ -10,329 +10,417 @@
 //           over ~350 ms, matching the CSS transition it replaces.
 //   head  — a brighter dot riding the arc tip.
 //
+// This file keeps its OWN instanced-quad vertex stage, so it composes
+// with the gpu-mini helpers prelude (sd_round_box, quad_corner) —
+// never the shared fullscreen triangle.
+//
 // Tile-sheet layout (8 f32s — lib.rs doc):
-//   [0,1] center (device px) · [2] halfW · [3] halfH · [4] cornerR ·
-//   [5] progress 0..1 · [6] shape (0=circle, 1=rounded rect) · [7] pad
+//   [0,1] center_px · [2] half_width · [3] half_height ·
+//   [4] corner_radius · [5] fill_progress 0..1 ·
+//   [6] shape_kind (0=circle, 1=rounded rect) · [7] reserved
 //
 // Uniform layout (f32s=16):
-//   [0,1] res · [2] time_s · [3] hair half-width ·
-//   [4..8) track rgba · [8..12) fill rgba · [12..16) head rgba
+//   [0,1] resolution_dev · [2] time_seconds · [3] hairline_half ·
+//   [4..8) track_rgba · [8..12) fill_rgba · [12..16) head_rgba
 
-struct U {
-    res    : vec2<f32>,
-    time   : f32,
-    hair   : f32,
-    track  : vec4<f32>,
-    fill   : vec4<f32>,
-    head   : vec4<f32>,
+struct Uniforms {
+    resolution_dev: vec2<f32>,
+    time_seconds: f32,
+    hairline_half: f32,
+    track_rgba: vec4<f32>,
+    fill_rgba: vec4<f32>,
+    head_rgba: vec4<f32>,
 };
 
-struct TileRec {
-    center   : vec2<f32>,
-    halfw    : f32,
-    halfh    : f32,
-    cornerr  : f32,
-    progress : f32,
-    shape    : f32,
-    pad      : f32,
+struct TileRecord {
+    center_px: vec2<f32>,
+    half_width: f32,
+    half_height: f32,
+    corner_radius: f32,
+    fill_progress: f32,
+    shape_kind: f32,
+    reserved: f32,
 };
 
-@group(0) @binding(0) var<uniform> u : U;
-@group(0) @binding(1) var<storage, read> tiles : array<TileRec>;
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@group(0) @binding(1) var<storage, read> tiles: array<TileRecord>;
 
-fn corner(v : u32) -> vec2<f32> {
-    let t = array<vec2<f32>, 6>(
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(1.0, 0.0),
-        vec2<f32>(0.0, 1.0),
-        vec2<f32>(0.0, 1.0),
-        vec2<f32>(1.0, 0.0),
-        vec2<f32>(1.0, 1.0),
-    );
+// ── Tunables ─────────────────────────────────────────────────────────
 
-    return t[v];
-}
+// Geometry constants (kept as written — the shader's arc tables were
+// tuned to these exact truncations, not the f64 literals).
+const HALF_PI: f32 = 1.5707963;
+const PI: f32 = 3.1415927;
+const THREE_HALF_PI: f32 = 4.712389;
+const TAU: f32 = 6.2831853;
 
-struct Out {
-    @builtin(position) clip  : vec4<f32>,
-    @location(0) frag        : vec2<f32>,
-    @location(1) inst        : f32,
+// Vertex stage — each instance's quad covers the tile bounds plus a
+// hairline slack (the glow must paint OUTSIDE the border line).
+const SLACK_HAIR_MULT: f32 = 4.0;
+const SLACK_PX: f32 = 1.0;
+
+// Shape discriminant — shape_kind is an f32 in the tile record;
+// <0.5 is the circle branch.
+const SHAPE_RECT_MIN: f32 = 0.5;
+
+// The ring band's AA edge (±1px around the half-hairline).
+const RING_AA_PX: f32 = 1.0;
+// The head dot is 3× the hairline half-width.
+const HEAD_RADIUS_MULT: f32 = 3.0;
+const HEAD_AA_PX: f32 = 1.0;
+// Pixels this faint are culled before the lighting pass runs.
+const LIVE_EPSILON: f32 = 0.001;
+
+// Light physics — the fill is a beam sweeping the border:
+//   drawn    — already-swept perimeter stays lit (the stroke remains)
+//   trail    — the hot comet tail decaying behind the tip
+//   fringes  — chromatic refraction split at the trail's live edge
+//   cast     — inverse halo the beam throws onto the surface
+const DRAWN_SOFT: f32 = 0.003;      // drawn-edge AA band (perimeter t)
+const TRAIL_DECAY: f32 = 14.0;      // comet-tail falloff rate
+const FRINGE_SPLIT: f32 = 0.02;     // chromatic split width
+const FRINGE_RED_DECAY: f32 = 8.0;  // red fringe reach
+const FRINGE_BLUE_DECAY: f32 = 30.0;// blue fringe falloff
+const FRINGE_RED_GAIN: f32 = 30.0;  // red fringe strength
+const FRINGE_BLUE_GAIN: f32 = 6.0;  // blue fringe strength
+const CAST_ARC_DECAY: f32 = 26.0;   // cast falloff along the perimeter
+const CAST_BAND_DECAY: f32 = 0.55;  // cast falloff away from the border
+const CAST_RGB: f32 = 0.35;         // cast strength into rgb
+const CAST_ALPHA: f32 = 0.22;       // cast strength into alpha
+const STROKE_DIM: f32 = 0.55;       // persistent drawn stroke vs tail
+
+// Head — hot core + inverse-square halo + orbiting sparks.
+const HEAD_CORE_FRAC: f32 = 0.5;   // core radius = head_r × this
+const HEAD_HALO_SCALE: f32 = 2.5;  // inverse-square halo reach
+const HEAD_HALO_FLOOR: f32 = 0.4;  // halo minimum (keeps it additive)
+const HEAD_HALO_GAIN: f32 = 0.5;   // halo strength multiplier
+const PROGRESS_EPSILON: f32 = 0.001; // head hides at sweep ends
+
+// Sparks — deterministic orbiters flickering with time: 2π/3 phase
+// spacing, per-spark detuned angular speeds and orbit radii.
+const SPARK_COUNT: u32 = 3u;
+const SPARK_PHASE_STEP: f32 = 2.0943951; // 2π/3
+const SPARK_SPEED_BASE: f32 = 1.7;
+const SPARK_SPEED_STEP: f32 = 0.9;
+const SPARK_ORBIT_BASE: f32 = 1.6;
+const SPARK_ORBIT_AMP: f32 = 0.5;
+const SPARK_ORBIT_SPEED: f32 = 3.0;
+const SPARK_ORBIT_PHASE: f32 = 7.0;
+const SPARK_INNER_PX: f32 = 1.0;
+const SPARK_OUTER_PX: f32 = 2.2;
+const SPARK_TWINKLE_SPEED: f32 = 9.0;
+const SPARK_TWINKLE_PHASE: f32 = 13.0;
+
+// Output rgb clamps at 1.5 — headroom for the additive hot core to
+// bloom through the premult blend without clipping to a flat disc.
+const MAX_RGB: f32 = 1.5;
+
+struct VertexOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) pixel_px: vec2<f32>,
+    @location(1) instance_t: f32,
 };
 
-/// `vs_main` — each instance covers the tile's bounding box plus hairline slack.
+/// `vs_main` — each instance covers the tile's bounding box plus
+/// hairline slack; geometry is synthesized from the shared quad table,
+/// no vertex buffers.
 @vertex
 fn vs_main(
-    @builtin(vertex_index) v : u32,
-    @builtin(instance_index) inst : u32,
-) -> Out {
-    var out : Out;
-    let c = corner(v);
-    let rec = tiles[inst];
-    let slack = u.hair * 4.0 + 1.0;
-    let lo = rec.center - vec2<f32>(rec.halfw, rec.halfh) - vec2<f32>(slack);
-    let sz = vec2<f32>(rec.halfw * 2.0 + slack * 2.0, rec.halfh * 2.0 + slack * 2.0);
+    @builtin(vertex_index) vertex_index: u32,
+    @builtin(instance_index) instance_index: u32,
+) -> VertexOut {
+    var output: VertexOut;
+    let corner_uv = quad_corner(vertex_index);
+    let tile = tiles[instance_index];
+    let bleed = uniforms.hairline_half * SLACK_HAIR_MULT + SLACK_PX;
+    let origin_px = tile.center_px - vec2<f32>(tile.half_width, tile.half_height) - vec2<f32>(bleed);
+    let size_px = vec2<f32>(tile.half_width * 2.0 + bleed * 2.0, tile.half_height * 2.0 + bleed * 2.0);
 
-    let px = lo + c * sz;
-    let ndc = vec2<f32>(px.x / u.res.x * 2.0 - 1.0, 1.0 - px.y / u.res.y * 2.0);
+    let pixel_px = origin_px + corner_uv * size_px;
+    let clip_xy = vec2<f32>(
+        pixel_px.x / uniforms.resolution_dev.x * 2.0 - 1.0,
+        1.0 - pixel_px.y / uniforms.resolution_dev.y * 2.0,
+    );
 
-    out.clip = vec4<f32>(ndc, 0.0, 1.0);
-    out.frag = px;
-    out.inst = f32(inst);
+    output.position = vec4<f32>(clip_xy, 0.0, 1.0);
+    output.pixel_px = pixel_px;
+    output.instance_t = f32(instance_index);
 
-    return out;
+    return output;
 }
 
-/// Rounded-rect SDF — signed distance to the box boundary.
-fn sd_rrect(p : vec2<f32>, b : vec2<f32>, r : f32) -> f32 {
-    let q = abs(p) - b + vec2<f32>(r);
+/// `rrect_perimeter_t` — perimeter parameter t∈[0,1] of the closest
+/// rounded-rect border point, walking the 8 segments clockwise from
+/// the top edge's left end (straight→arc alternating).
+fn rrect_perimeter_t(point: vec2<f32>, half_width: f32, half_height: f32, radius: f32) -> f32 {
+    let straight_w = 2.0 * (half_width - radius);
+    let straight_h = 2.0 * (half_height - radius);
+    let arc_len = HALF_PI * radius;
+    let perimeter = 2.0 * (straight_w + straight_h) + 4.0 * arc_len;
 
-    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
-}
-
-/// Perimeter parameter t∈[0,1] of the closest rrect border point —
-/// 8 segments walked clockwise from the top edge's left end.
-fn rrect_t(p : vec2<f32>, hw : f32, hh : f32, r : f32) -> f32 {
-    let tw = 2.0 * (hw - r);
-    let th = 2.0 * (hh - r);
-    let arc = 1.5707963 * r;
-    let total = 2.0 * (tw + th) + 4.0 * arc;
-
-    var best_d = 1e9;
+    var best_dist = 1e9;
     var best_t = 0.0;
-    let off = vec2<f32>(hw - r, hh - r);
+    let corner_center = vec2<f32>(half_width - radius, half_height - radius);
 
     // top edge
-    var pr = clamp(p.x, -off.x, off.x);
-    var d = abs(p.y + hh) + abs(p.x - pr);
-    var l = pr + off.x;
+    var proj = clamp(point.x, -corner_center.x, corner_center.x);
+    var dist = abs(point.y + half_height) + abs(point.x - proj);
+    var length_t = proj + corner_center.x;
 
-    best_d = d;
-    best_t = l;
+    best_dist = dist;
+    best_t = length_t;
 
     // TR arc (θ −π/2 → 0)
-    var a = atan2(p.y + off.y, p.x - off.x) + 1.5707963;
+    var angle = atan2(point.y + corner_center.y, point.x - corner_center.x) + HALF_PI;
 
-    if (a < 0.0) { a = a + 6.2831853; }
+    if (angle < 0.0) { angle = angle + TAU; }
 
-    a = clamp(a, 0.0, 1.5707963);
-    d = abs(length(p - vec2<f32>(off.x, -off.y)) - r);
-    l = tw + a * r;
+    angle = clamp(angle, 0.0, HALF_PI);
+    dist = abs(length(point - vec2<f32>(corner_center.x, -corner_center.y)) - radius);
+    length_t = straight_w + angle * radius;
 
-    if (d < best_d) { best_d = d; best_t = l; }
+    if (dist < best_dist) { best_dist = dist; best_t = length_t; }
 
     // right edge
-    pr = clamp(p.y, -off.y, off.y);
-    d = abs(p.x - hw) + abs(p.y - pr);
-    l = tw + arc + (pr + off.y);
+    proj = clamp(point.y, -corner_center.y, corner_center.y);
+    dist = abs(point.x - half_width) + abs(point.y - proj);
+    length_t = straight_w + arc_len + (proj + corner_center.y);
 
-    if (d < best_d) { best_d = d; best_t = l; }
+    if (dist < best_dist) { best_dist = dist; best_t = length_t; }
 
     // BR arc (θ 0 → π/2)
-    a = atan2(p.y - off.y, p.x - off.x);
+    angle = atan2(point.y - corner_center.y, point.x - corner_center.x);
 
-    if (a < 0.0) { a = a + 6.2831853; }
+    if (angle < 0.0) { angle = angle + TAU; }
 
-    a = clamp(a, 0.0, 1.5707963);
-    d = abs(length(p - off) - r);
-    l = tw + arc + th + a * r;
+    angle = clamp(angle, 0.0, HALF_PI);
+    dist = abs(length(point - corner_center) - radius);
+    length_t = straight_w + arc_len + straight_h + angle * radius;
 
-    if (d < best_d) { best_d = d; best_t = l; }
+    if (dist < best_dist) { best_dist = dist; best_t = length_t; }
 
     // bottom edge (right → left)
-    pr = clamp(p.x, -off.x, off.x);
-    d = abs(p.y - hh) + abs(p.x - pr);
-    l = tw + arc + th + arc + (off.x - pr);
+    proj = clamp(point.x, -corner_center.x, corner_center.x);
+    dist = abs(point.y - half_height) + abs(point.x - proj);
+    length_t = straight_w + arc_len + straight_h + arc_len + (corner_center.x - proj);
 
-    if (d < best_d) { best_d = d; best_t = l; }
+    if (dist < best_dist) { best_dist = dist; best_t = length_t; }
 
     // BL arc (θ π/2 → π)
-    a = atan2(p.y - off.y, p.x + off.x);
+    angle = atan2(point.y - corner_center.y, point.x + corner_center.x);
 
-    if (a < 0.0) { a = a + 6.2831853; }
+    if (angle < 0.0) { angle = angle + TAU; }
 
-    a = clamp(a, 1.5707963, 3.1415927);
-    d = abs(length(p + vec2<f32>(off.x, -off.y)) - r);
-    l = tw + arc + th + arc + tw + (a - 1.5707963) * r;
+    angle = clamp(angle, HALF_PI, PI);
+    dist = abs(length(point + vec2<f32>(corner_center.x, -corner_center.y)) - radius);
+    length_t = straight_w + arc_len + straight_h + arc_len + straight_w + (angle - HALF_PI) * radius;
 
-    if (d < best_d) { best_d = d; best_t = l; }
+    if (dist < best_dist) { best_dist = dist; best_t = length_t; }
 
     // left edge (bottom → top)
-    pr = clamp(p.y, -off.y, off.y);
-    d = abs(p.x + hw) + abs(p.y - pr);
-    l = 2.0 * (tw + arc) + th + (off.y - pr);
+    proj = clamp(point.y, -corner_center.y, corner_center.y);
+    dist = abs(point.x + half_width) + abs(point.y - proj);
+    length_t = 2.0 * (straight_w + arc_len) + straight_h + (corner_center.y - proj);
 
-    if (d < best_d) { best_d = d; best_t = l; }
+    if (dist < best_dist) { best_dist = dist; best_t = length_t; }
 
     // TL arc (θ π → 3π/2)
-    a = atan2(p.y + off.y, p.x + off.x);
+    angle = atan2(point.y + corner_center.y, point.x + corner_center.x);
 
-    if (a < 0.0) { a = a + 6.2831853; }
+    if (angle < 0.0) { angle = angle + TAU; }
 
-    a = clamp(a, 3.1415927, 4.712389);
-    d = abs(length(p + off) - r);
-    l = 2.0 * (tw + arc + th) + (a - 3.1415927) * r;
+    angle = clamp(angle, PI, THREE_HALF_PI);
+    dist = abs(length(point + corner_center) - radius);
+    length_t = 2.0 * (straight_w + arc_len + straight_h) + (angle - PI) * radius;
 
-    if (d < best_d) { best_d = d; best_t = l; }
+    if (dist < best_dist) { best_dist = dist; best_t = length_t; }
 
-    return clamp(best_t / total, 0.0, 1.0);
+    return clamp(best_t / perimeter, 0.0, 1.0);
 }
 
-/// Point on the rrect perimeter at arc-length t — mirrors rrect_t's walk.
-fn rrect_point(t : f32, hw : f32, hh : f32, r : f32) -> vec2<f32> {
-    let tw = 2.0 * (hw - r);
-    let th = 2.0 * (hh - r);
-    let arc = 1.5707963 * r;
-    let off = vec2<f32>(hw - r, hh - r);
-    var s = t;
+/// `rrect_perimeter_point` — point on the rounded-rect perimeter at
+/// arc-length `arc_length` — mirrors rrect_perimeter_t's segment walk.
+fn rrect_perimeter_point(arc_length: f32, half_width: f32, half_height: f32, radius: f32) -> vec2<f32> {
+    let straight_w = 2.0 * (half_width - radius);
+    let straight_h = 2.0 * (half_height - radius);
+    let arc_len = HALF_PI * radius;
+    let corner_center = vec2<f32>(half_width - radius, half_height - radius);
+    var remaining = arc_length;
 
-    if (s < tw) { return vec2<f32>(-off.x + s, -hh); }
-    s = s - tw;
+    if (remaining < straight_w) { return vec2<f32>(-corner_center.x + remaining, -half_height); }
+    remaining = remaining - straight_w;
 
-    if (s < arc) {
-        let a = s / r - 1.5707963;
+    if (remaining < arc_len) {
+        let angle = remaining / radius - HALF_PI;
 
-        return vec2<f32>(off.x + r * cos(a), -off.y + r * sin(a));
+        return vec2<f32>(corner_center.x + radius * cos(angle), -corner_center.y + radius * sin(angle));
     }
-    s = s - arc;
+    remaining = remaining - arc_len;
 
-    if (s < th) { return vec2<f32>(hw, -off.y + s); }
-    s = s - th;
+    if (remaining < straight_h) { return vec2<f32>(half_width, -corner_center.y + remaining); }
+    remaining = remaining - straight_h;
 
-    if (s < arc) {
-        let a = s / r;
+    if (remaining < arc_len) {
+        let angle = remaining / radius;
 
-        return vec2<f32>(off.x + r * cos(a), off.y + r * sin(a));
+        return vec2<f32>(corner_center.x + radius * cos(angle), corner_center.y + radius * sin(angle));
     }
-    s = s - arc;
+    remaining = remaining - arc_len;
 
-    if (s < tw) { return vec2<f32>(off.x - s, hh); }
-    s = s - tw;
+    if (remaining < straight_w) { return vec2<f32>(corner_center.x - remaining, half_height); }
+    remaining = remaining - straight_w;
 
-    if (s < arc) {
-        let a = s / r + 1.5707963;
+    if (remaining < arc_len) {
+        let angle = remaining / radius + HALF_PI;
 
-        return vec2<f32>(-off.x + r * cos(a), off.y + r * sin(a));
+        return vec2<f32>(-corner_center.x + radius * cos(angle), corner_center.y + radius * sin(angle));
     }
-    s = s - arc;
+    remaining = remaining - arc_len;
 
-    if (s < th) { return vec2<f32>(-hw, off.y - s); }
-    s = s - th;
+    if (remaining < straight_h) { return vec2<f32>(-half_width, corner_center.y - remaining); }
+    remaining = remaining - straight_h;
 
-    let a = s / r + 3.1415927;
+    let angle = remaining / radius + PI;
 
-    return vec2<f32>(-off.x + r * cos(a), -off.y + r * sin(a));
+    return vec2<f32>(-corner_center.x + radius * cos(angle), -corner_center.y + radius * sin(angle));
 }
 
 /// `fs_main` — track ring + progress arc + head dot, per shape.
 @fragment
-fn fs_main(v : Out) -> @location(0) vec4<f32> {
-    let rec = tiles[u32(v.inst + 0.5)];
-    let dvec = v.frag - rec.center;
+fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    let tile = tiles[u32(input.instance_t + 0.5)];
+    let to_pixel = input.pixel_px - tile.center_px;
 
-    var band = 0.0;
-    var t = 0.0;
-    var tip = rec.center;
+    var border_dist = 0.0;
+    var perimeter_t = 0.0;
+    var tip_px = tile.center_px;
 
-    if (rec.shape < 0.5) {
-        // circle — radius = halfW; angle sweep from 12 o'clock.
-        let dist = length(dvec);
+    if (tile.shape_kind < SHAPE_RECT_MIN) {
+        // circle — radius = half_width; angle sweep from 12 o'clock.
+        let center_dist = length(to_pixel);
 
-        band = abs(dist - rec.halfw);
+        border_dist = abs(center_dist - tile.half_width);
 
-        var a = atan2(dvec.x, -dvec.y) / 6.2831853;
+        var angle_t = atan2(to_pixel.x, -to_pixel.y) / TAU;
 
-        if (a < 0.0) { a = a + 1.0; }
+        if (angle_t < 0.0) { angle_t = angle_t + 1.0; }
 
-        t = a;
+        perimeter_t = angle_t;
 
-        let ta = rec.progress * 6.2831853;
+        let tip_angle = tile.fill_progress * TAU;
 
-        tip = rec.center + rec.halfw * vec2<f32>(sin(ta), -cos(ta));
+        tip_px = tile.center_px + tile.half_width * vec2<f32>(sin(tip_angle), -cos(tip_angle));
     } else {
         // rounded rect — perimeter sweep from the top edge's left end.
-        band = abs(sd_rrect(dvec, vec2<f32>(rec.halfw, rec.halfh), rec.cornerr));
-        t = rrect_t(dvec, rec.halfw, rec.halfh, rec.cornerr);
+        border_dist = abs(sd_round_box(to_pixel, vec2<f32>(tile.half_width, tile.half_height), tile.corner_radius));
+        perimeter_t = rrect_perimeter_t(to_pixel, tile.half_width, tile.half_height, tile.corner_radius);
 
-        let tw = 2.0 * (rec.halfw - rec.cornerr);
-        let th = 2.0 * (rec.halfh - rec.cornerr);
-        let arc = 1.5707963 * rec.cornerr;
-        let total = 2.0 * (tw + th) + 4.0 * arc;
+        let straight_w = 2.0 * (tile.half_width - tile.corner_radius);
+        let straight_h = 2.0 * (tile.half_height - tile.corner_radius);
+        let arc_len = HALF_PI * tile.corner_radius;
+        let perimeter = 2.0 * (straight_w + straight_h) + 4.0 * arc_len;
 
-        tip = rec.center + rrect_point(rec.progress * total, rec.halfw, rec.halfh, rec.cornerr);
+        tip_px = tile.center_px + rrect_perimeter_point(
+            tile.fill_progress * perimeter,
+            tile.half_width,
+            tile.half_height,
+            tile.corner_radius,
+        );
     }
 
-    let ring = 1.0 - smoothstep(u.hair - 1.0, u.hair + 1.0, band);
+    let ring_mask = 1.0 - smoothstep(
+        uniforms.hairline_half - RING_AA_PX,
+        uniforms.hairline_half + RING_AA_PX,
+        border_dist,
+    );
 
-    let head_r = u.hair * 3.0;
-    let head = 1.0 - smoothstep(head_r - 1.0, head_r + 1.0, length(v.frag - tip));
+    let head_radius = uniforms.hairline_half * HEAD_RADIUS_MULT;
+    let head_mask = 1.0 - smoothstep(head_radius - HEAD_AA_PX, head_radius + HEAD_AA_PX, length(input.pixel_px - tip_px));
 
-    if (ring <= 0.001 && head <= 0.001) {
+    if (ring_mask <= LIVE_EPSILON && head_mask <= LIVE_EPSILON) {
         discard;
     }
 
-    // ── Light physics ─────────────────────────────────────────────────────
+    // ── Light physics ────────────────────────────────────────────────
     // The fill is a light beam sweeping the border: chromatic refraction
-    // fringes at the arc edge, an inverse-square halo cast onto the surface
-    // (reflection), and spark particles riding the head.
+    // fringes at the arc edge, an inverse-square halo cast onto the
+    // surface (reflection), and spark particles riding the head.
 
     // Wrap-around distance along the perimeter to the beam tail.
-    let wrapped = abs(t - rec.progress);
-    let arc_d = min(wrapped, 1.0 - wrapped);
+    let wrapped_dist = abs(perimeter_t - tile.fill_progress);
+    let arc_dist = min(wrapped_dist, 1.0 - wrapped_dist);
 
     // The light tip draws the border: already-drawn stays lit (stroke
     // remains), and a bright trail decays behind the head like a comet
     // tail — reads as light traveling, not a filling gauge.
-    let drawn = 1.0 - smoothstep(rec.progress - 0.003, rec.progress + 0.003, t);
+    let drawn_mask = 1.0 - smoothstep(
+        tile.fill_progress - DRAWN_SOFT,
+        tile.fill_progress + DRAWN_SOFT,
+        perimeter_t,
+    );
 
-    let trail = drawn * exp(-arc_d * 14.0);
+    let trail_glow = drawn_mask * exp(-arc_dist * TRAIL_DECAY);
 
-    var col = u.track * ring;
+    var color = uniforms.track_rgba * ring_mask;
 
     // Persistent drawn stroke — dimmer than the track so the tail leads.
-    col = col + u.fill * ring * drawn * 0.55;
+    color = color + uniforms.fill_rgba * ring_mask * drawn_mask * STROKE_DIM;
 
     // Comet tail — the hot part just behind the tip.
-    col = col + u.fill * ring * trail;
+    color = color + uniforms.fill_rgba * ring_mask * trail_glow;
 
     // Refraction fringes — chromatic split at the trail's live edge.
-    let fringe_e = 0.02;
-    let edge_r = trail * exp(-arc_d * 8.0);
-    let edge_b = drawn * (1.0 - exp(-arc_d * 30.0));
+    let fringe_red_edge = trail_glow * exp(-arc_dist * FRINGE_RED_DECAY);
+    let fringe_blue_edge = drawn_mask * (1.0 - exp(-arc_dist * FRINGE_BLUE_DECAY));
 
-    col.r = col.r + u.fill.r * ring * edge_r * fringe_e * 30.0;
-    col.b = col.b + u.fill.b * ring * edge_b * fringe_e * 6.0;
+    // Whole-vec4 writes — multi-component swizzle assignment
+    // (`color.rgb = …`) is rejected by strict naga validators.
+    color = vec4<f32>(
+        color.rgb + vec3<f32>(
+            uniforms.fill_rgba.r * ring_mask * fringe_red_edge * FRINGE_SPLIT * FRINGE_RED_GAIN,
+            0.0,
+            uniforms.fill_rgba.b * ring_mask * fringe_blue_edge * FRINGE_SPLIT * FRINGE_BLUE_GAIN,
+        ),
+        color.a,
+    );
 
-    // Reflection — light cast off the ring onto the surface, falls off
-    // with distance-to-beam (perimeter arc) × distance-to-border.
-    let cast = exp(-arc_d * 26.0) * exp(-band * 0.55) * u.fill.a;
+    // Reflection — light cast off the ring onto the surface, falling
+    // off with distance-to-beam (perimeter arc) × distance-to-border.
+    // (`cast` is a reserved WGSL keyword — name it cast_light.)
+    let cast_light = exp(-arc_dist * CAST_ARC_DECAY) * exp(-border_dist * CAST_BAND_DECAY) * uniforms.fill_rgba.a;
 
-    col.rgb = col.rgb + u.fill.rgb * cast * 0.35;
-    col.a = max(col.a, cast * 0.22);
+    color = vec4<f32>(
+        color.rgb + uniforms.fill_rgba.rgb * cast_light * CAST_RGB,
+        max(color.a, cast_light * CAST_ALPHA),
+    );
 
     // Head — hot core + inverse-square halo + sparks.
-    let head_d = length(v.frag - tip);
-    let core = 1.0 - smoothstep(head_r * 0.5, head_r, head_d);
-    let halo = u.head.a * head_r * 2.5 / max(head_d, head_r * 0.5) - u.head.a * 0.4;
+    let head_dist = length(input.pixel_px - tip_px);
+    let core_mask = 1.0 - smoothstep(head_radius * HEAD_CORE_FRAC, head_radius, head_dist);
+    let halo_strength = uniforms.head_rgba.a * head_radius * HEAD_HALO_SCALE
+        / max(head_dist, head_radius * HEAD_CORE_FRAC) - uniforms.head_rgba.a * HEAD_HALO_FLOOR;
 
-    if (rec.progress > 0.001 && rec.progress < 0.999) {
-        col = mix(col, u.head, core);
-        col.rgb = col.rgb + u.head.rgb * clamp(halo, 0.0, 1.0) * 0.5;
-        col.a = max(col.a, clamp(halo, 0.0, 1.0) * 0.5);
+    if (tile.fill_progress > PROGRESS_EPSILON && tile.fill_progress < 1.0 - PROGRESS_EPSILON) {
+        color = mix(color, uniforms.head_rgba, core_mask);
+        color = vec4<f32>(
+            color.rgb + uniforms.head_rgba.rgb * clamp(halo_strength, 0.0, 1.0) * HEAD_HALO_GAIN,
+            max(color.a, clamp(halo_strength, 0.0, 1.0) * HEAD_HALO_GAIN),
+        );
 
-        // 3 sparks — deterministic orbiters flickering with time.
-        for (var s = 0u; s < 3u; s = s + 1u) {
-            let sf = f32(s) * 2.0943951;
-            let ang = sf + u.time * (1.7 + f32(s) * 0.9);
-            let rad = head_r * (1.6 + 0.5 * sin(u.time * 3.0 + sf * 7.0));
-            let sp = tip + rad * vec2<f32>(cos(ang), sin(ang));
-            let sd = 1.0 - smoothstep(1.0, 2.2, length(v.frag - sp));
-            let tw = 0.5 + 0.5 * sin(u.time * 9.0 + sf * 13.0);
+        // Sparks — deterministic orbiters flickering with time.
+        for (var spark_i = 0u; spark_i < SPARK_COUNT; spark_i = spark_i + 1u) {
+            let spark_phase = f32(spark_i) * SPARK_PHASE_STEP;
+            let spark_angle = spark_phase + uniforms.time_seconds * (SPARK_SPEED_BASE + f32(spark_i) * SPARK_SPEED_STEP);
+            let spark_orbit = head_radius * (SPARK_ORBIT_BASE + SPARK_ORBIT_AMP * sin(uniforms.time_seconds * SPARK_ORBIT_SPEED + spark_phase * SPARK_ORBIT_PHASE));
+            let spark_px = tip_px + spark_orbit * vec2<f32>(cos(spark_angle), sin(spark_angle));
+            let spark_mask = 1.0 - smoothstep(SPARK_INNER_PX, SPARK_OUTER_PX, length(input.pixel_px - spark_px));
+            let spark_twinkle = 0.5 + 0.5 * sin(uniforms.time_seconds * SPARK_TWINKLE_SPEED + spark_phase * SPARK_TWINKLE_PHASE);
 
-            col = mix(col, u.head, sd * tw);
+            color = mix(color, uniforms.head_rgba, spark_mask * spark_twinkle);
         }
     }
 
-    let alpha = max(col.a, ring * u.track.a * (1.0 - drawn));
+    let alpha = max(color.a, ring_mask * uniforms.track_rgba.a * (1.0 - drawn_mask));
 
-    return vec4<f32>(clamp(col.rgb, vec3<f32>(0.0), vec3<f32>(1.5)), clamp(alpha, 0.0, 1.0));
+    return vec4<f32>(clamp(color.rgb, vec3<f32>(0.0), vec3<f32>(MAX_RGB)), clamp(alpha, 0.0, 1.0));
 }

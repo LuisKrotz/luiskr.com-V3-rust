@@ -24,16 +24,18 @@
 //! # Uniform layout (f32s = 16 — mirrors
 //! `GPU_WIDGET_UNIFORM_F32S[CORNER_BRACKETS]` and the WGSL struct)
 //!
-//!   [0,1]   res     canvas DEVICE px
-//!   [2]     hover   eased hover progress 0..1 (JS drives the ease —
-//!                     one scalar, updated while the pointer state
-//!                     changes; static otherwise)
-//!   [3]     hair    hairline half-width (device px)
-//!   [4,5]   arm0    stub arm lengths (w, h device px)
-//!   [6,7]   arm1    full arm lengths (w, h device px — JS computes
-//!                     from the rect so the shader stays scalar)
-//!   [8..12] edge    bracket color rgba (var(--border-ink) parity)
-//!   [12..16] accent hover rgba (var(--color-accent) parity)
+//!   [0,1]   resolution_dev  canvas DEVICE px
+//!   [2]     hover_amount    eased hover progress 0..1 (JS drives the
+//!                     ease — one scalar, updated while the pointer
+//!                     state changes; static otherwise)
+//!   [3]     hairline_half   hairline half-width (device px)
+//!   [4,5]   arm_rest        stub arm lengths (w, h device px)
+//!   [6,7]   arm_hover       full arm lengths (w, h device px — JS
+//!                     computes from the rect so the shader stays
+//!                     scalar)
+//!   [8..12] edge_rgba       bracket color rgba (var(--border-ink)
+//!                     parity)
+//!   [12..16] accent_rgba    hover rgba (var(--color-accent) parity)
 //!
 //! # Bindings
 //!
@@ -62,27 +64,27 @@ struct Gpu {
     /// The fullscreen-triangle pipeline.
     pipeline: web_sys::GpuRenderPipeline,
     /// Uniform block — the 16-f32 layout above.
-    ubuf: web_sys::GpuBuffer,
+    uniform_buffer: web_sys::GpuBuffer,
     /// Bound uniform — static for the surface's lifetime.
-    bind: web_sys::GpuBindGroup,
+    bind_group: web_sys::GpuBindGroup,
 }
 
 /// Scalar state repacked into the uniform block per frame.
 struct State {
-    /// Canvas DEVICE px — `res`.
-    dev: [f32; 2],
+    /// Canvas DEVICE px — `resolution_dev`.
+    resolution_dev: [f32; 2],
     /// Eased hover progress 0..1 — arm length + tint lerp.
-    hover: f32,
+    hover_amount: f32,
     /// Hairline half-width (device px).
-    hair: f32,
+    hairline_half: f32,
     /// Stub arm lengths (w, h device px).
-    arm0: [f32; 2],
+    arm_rest: [f32; 2],
     /// Full arm lengths (w, h device px).
-    arm1: [f32; 2],
+    arm_hover: [f32; 2],
     /// Resting bracket color rgba.
-    edge: [f32; 4],
+    edge_rgba: [f32; 4],
     /// Hover accent color rgba.
-    accent: [f32; 4],
+    accent_rgba: [f32; 4],
 }
 
 /// Public wasm surface — one bracket canvas per button.
@@ -100,16 +102,19 @@ impl CornerBrackets {
     /// follow.
     #[wasm_bindgen(constructor)]
     pub fn new() -> CornerBrackets {
+        // Pre-init state: no GPU yet; the arm/color values below are
+        // placeholders — `set_arms`/`set_colors` push the real
+        // rect-derived metrics before the first frame is pumped.
         CornerBrackets {
             gpu: RefCell::new(None),
             state: RefCell::new(State {
-                dev: [1.0, 1.0],
-                hover: 0.0,
-                hair: 1.0,
-                arm0: [16.0, 16.0],
-                arm1: [200.0, 48.0],
-                edge: [0.5, 0.5, 0.5, 1.0],
-                accent: [0.4, 0.7, 1.0, 1.0],
+                resolution_dev: [1.0, 1.0],
+                hover_amount: 0.0,
+                hairline_half: 1.0,
+                arm_rest: [16.0, 16.0],
+                arm_hover: [200.0, 48.0],
+                edge_rgba: [0.5, 0.5, 0.5, 1.0],
+                accent_rgba: [0.4, 0.7, 1.0, 1.0],
             }),
         }
     }
@@ -120,27 +125,38 @@ impl CornerBrackets {
     /// @param device The shared GPUDevice (one per page, from the JS bridge).
     /// @returns Ok on a live surface, Err(JsValue) on failure.
     pub fn init(&self, canvas: HtmlCanvasElement, device: GpuDevice) -> Result<(), JsValue> {
+        // Step 1 — wrap the canvas in a configured surface.
         let surface = gpu_mini::init_surface(&canvas, &device)?;
 
+        // Step 2 — bind-group layout: one uniform block at binding 0.
         let layout = gpu_mini::new_layout(&surface.device, &[gpu_mini::uniform_entry(0)])?;
+
+        // Step 3 — compile the pipeline against the surface's
+        // negotiated format. The shader keeps its own vs_main (it
+        // emits device-px fragment coords), so it takes the helpers
+        // prelude, not the fullscreen triangle source.
+        let source = gpu_mini::wgsl::helpers_source(WGSL);
 
         let pipeline = gpu_mini::fullscreen_pipeline(
             &surface.device,
             surface.format,
-            WGSL,
+            &source,
             &[layout.clone()],
         )?;
 
-        let ubuf = gpu_mini::new_buffer(
+        // Step 4 — the 16-f32 uniform buffer (CPU-writable each frame).
+        let uniform_buffer = gpu_mini::new_buffer(
             &surface.device,
             (UNIFORM_F32S * 4) as u32,
             gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST,
         )?;
 
-        let bind = gpu_mini::new_bind_group(
+        // Step 5 — bind the buffer once; it stays valid for the
+        // surface's whole lifetime.
+        let bind_group = gpu_mini::new_bind_group(
             &surface.device,
             &layout,
-            &[gpu_mini::bind_buffer_entry(0, &ubuf)],
+            &[gpu_mini::bind_buffer_entry(0, &uniform_buffer)],
         );
 
         // try_borrow everywhere: a JS exception crossing a wasm frame
@@ -149,11 +165,12 @@ impl CornerBrackets {
         let Ok(mut slot) = self.gpu.try_borrow_mut() else {
             return Err(JsValue::from_str("init: gpu slot poisoned"));
         };
+        // Publish the assembled GPU bundle — `frame` may now borrow it.
         *slot = Some(Gpu {
             surface,
             pipeline,
-            ubuf,
-            bind,
+            uniform_buffer,
+            bind_group,
         });
 
         Ok(())
@@ -163,101 +180,143 @@ impl CornerBrackets {
     /// ease so the shader stays stateless; pump frames while the
     /// value is moving, settle it to present the last frame).
     ///
-    /// @param v Eased progress 0..1 (0 = stub arms, 1 = full span).
-    pub fn set_hover(&self, v: f32) {
-        if let Ok(mut s) = self.state.try_borrow_mut() {
-            s.hover = v.clamp(0.0, 1.0);
+    /// @param progress Eased progress 0..1 (0 = stub arms, 1 = full span).
+    pub fn set_hover(&self, progress: f32) {
+        // try-borrow — drop the update if the slot is contended; the
+        // value is clamped into the shader's 0..1 lerp domain.
+        if let Ok(mut state) = self.state.try_borrow_mut() {
+            state.hover_amount = progress.clamp(0.0, 1.0);
         }
     }
 
     /// `set_arms` — push the stub/full arm lengths and hairline (all
     /// device px — JS computes them from the rect + tokens once).
     ///
-    /// @param a0w @param a0h Stub arm lengths.
-    /// @param a1w @param a1h Full arm lengths.
-    /// @param hair Hairline half-width in device px.
-    pub fn set_arms(&self, a0w: f32, a0h: f32, a1w: f32, a1h: f32, hair: f32) {
-        let Ok(mut s) = self.state.try_borrow_mut() else {
+    /// @param stub_width @param stub_height Stub arm lengths.
+    /// @param full_width @param full_height Full arm lengths.
+    /// @param hairline Hairline half-width in device px.
+    pub fn set_arms(
+        &self,
+        stub_width: f32,
+        stub_height: f32,
+        full_width: f32,
+        full_height: f32,
+        hairline: f32,
+    ) {
+        let Ok(mut state) = self.state.try_borrow_mut() else {
             return;
         };
 
-        s.arm0 = [a0w, a0h];
-        s.arm1 = [a1w, a1h];
-        s.hair = hair;
+        // Store the rect-derived geometry verbatim — JS already
+        // computed device px, no clamping needed here.
+        state.arm_rest = [stub_width, stub_height];
+
+        state.arm_hover = [full_width, full_height];
+
+        state.hairline_half = hairline;
     }
 
     /// `set_colors` — push the resting/hover colors (computed style
     /// read once per theme flip — the shader never sees CSS vars).
     ///
-    /// @param er @param eg @param eb @param ea Resting rgba 0-1.
-    /// @param ar @param ag @param ab @param aa Hover rgba 0-1.
+    /// @param edge_r @param edge_g @param edge_b @param edge_a Resting rgba 0-1.
+    /// @param accent_r @param accent_g @param accent_b @param accent_a Hover rgba 0-1.
     pub fn set_colors(
         &self,
-        er: f32,
-        eg: f32,
-        eb: f32,
-        ea: f32,
-        ar: f32,
-        ag: f32,
-        ab: f32,
-        aa: f32,
+        edge_r: f32,
+        edge_g: f32,
+        edge_b: f32,
+        edge_a: f32,
+        accent_r: f32,
+        accent_g: f32,
+        accent_b: f32,
+        accent_a: f32,
     ) {
-        let Ok(mut s) = self.state.try_borrow_mut() else {
+        let Ok(mut state) = self.state.try_borrow_mut() else {
             return;
         };
 
-        s.edge = [er, eg, eb, ea];
-        s.accent = [ar, ag, ab, aa];
+        // Store both rgba quads — the shader lerps edge → accent on
+        // `hover`, so it never reads CSS vars itself.
+        state.edge_rgba = [edge_r, edge_g, edge_b, edge_a];
+
+        state.accent_rgba = [accent_r, accent_g, accent_b, accent_a];
     }
 
     /// `set_size` — CSS px (contract parity; unused — device px only).
     ///
-    /// @param _w @param _h CSS size — unused.
-    pub fn set_size(&self, _w: f32, _h: f32) {}
+    /// @param _width @param _height CSS size — unused.
+    pub fn set_size(&self, _width: f32, _height: f32) {}
 
-    /// `resize` — device px — the `res` uniform.
+    /// `resize` — device px — the `resolution` uniform.
     ///
-    /// @param w @param h Backing size in device pixels.
-    pub fn resize(&self, w: f32, h: f32) {
-        if let Ok(mut s) = self.state.try_borrow_mut() {
-            s.dev = [w, h];
+    /// @param width @param height Backing size in device pixels.
+    pub fn resize(&self, width: f32, height: f32) {
+        // Store the device-px backing size — the shader's `resolution`
+        // uniform (unlike the other widgets, no ≥1 clamp: the WGSL
+        // guards its own divisions).
+        if let Ok(mut state) = self.state.try_borrow_mut() {
+            state.resolution_dev = [width, height];
         }
     }
 
     /// `frame` — repack the uniform block, draw the brackets.
     ///
-    /// @param _dt Frame delta — unused (the shader is stateless:
-    ///            `hover` is driven from JS so time never appears in
-    ///            the uniform).
+    /// @param _delta_seconds Frame delta — unused (the shader is
+    ///            stateless: `hover` is driven from JS so time never
+    ///            appears in the uniform).
     /// @returns false once the surface is stale/lost.
-    pub fn frame(&self, _dt: f32) -> bool {
+    pub fn frame(&self, _delta_seconds: f32) -> bool {
+        // Bail while init is in flight — JS treats `false` as "stop
+        // pumping", which is correct for a not-yet-live widget too.
         let Ok(gpu) = self.gpu.try_borrow() else {
             return false;
         };
 
-        let Some(g) = gpu.as_ref() else {
+        // Still `None` → init hasn't resolved.
+        let Some(gpu_state) = gpu.as_ref() else {
             return false;
         };
 
-        let Ok(s) = self.state.try_borrow() else {
+        // Snapshot the scalar state under the guard — held only for
+        // the repack below, never across the queue write.
+        let Ok(state) = self.state.try_borrow() else {
             return false;
         };
-        let mut u = [0.0f32; UNIFORM_F32S];
 
-        u[0] = s.dev[0];
-        u[1] = s.dev[1];
-        u[2] = s.hover;
-        u[3] = s.hair;
-        u[4] = s.arm0[0];
-        u[5] = s.arm0[1];
-        u[6] = s.arm1[0];
-        u[7] = s.arm1[1];
-        u[8..12].copy_from_slice(&s.edge);
-        u[12..16].copy_from_slice(&s.accent);
+        // Zero-init the block, then fill the documented layout…
+        let mut uniforms = [0.0f32; UNIFORM_F32S];
 
-        gpu_mini::write_f32s(&g.surface.queue, &g.ubuf, &u);
+        // [0,1] resolution — device px.
+        uniforms[0] = state.resolution_dev[0];
 
-        gpu_mini::draw(&g.surface, &g.pipeline, &g.bind, None)
+        uniforms[1] = state.resolution_dev[1];
+
+        // [2] eased hover progress — arm length + tint lerp.
+        uniforms[2] = state.hover_amount;
+
+        // [3] hairline half-width.
+        uniforms[3] = state.hairline_half;
+
+        // [4,5] stub arms, [6,7] full arms.
+        uniforms[4] = state.arm_rest[0];
+
+        uniforms[5] = state.arm_rest[1];
+
+        uniforms[6] = state.arm_hover[0];
+
+        uniforms[7] = state.arm_hover[1];
+
+        // [8..12] resting rgba, [12..16] hover accent rgba.
+        uniforms[8..12].copy_from_slice(&state.edge_rgba);
+
+        uniforms[12..16].copy_from_slice(&state.accent_rgba);
+
+        // Push the block to the GPU…
+        gpu_mini::write_f32s(&gpu_state.surface.queue, &gpu_state.uniform_buffer, &uniforms);
+
+        // …and draw; the bool reports whether the surface is still live.
+        gpu_mini::draw(&gpu_state.surface, &gpu_state.pipeline, &gpu_state.bind_group, None)
     }
 }
 
@@ -269,8 +328,8 @@ impl CornerBrackets {
 /// shared device; leaking the handles is safe and un-panickable.
 impl Drop for CornerBrackets {
     fn drop(&mut self) {
-        if let Some(g) = self.gpu.get_mut().take() {
-            std::mem::forget(g);
+        if let Some(gpu_state) = self.gpu.get_mut().take() {
+            std::mem::forget(gpu_state);
         }
     }
 }

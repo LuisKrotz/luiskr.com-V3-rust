@@ -12,12 +12,17 @@ use crate::sim::*;
 /// One letter 10×20 paper px + full ink + a full tint table — the
 /// minimal live-front fixture every test builds on.
 fn fixture(dir: f32) -> BurnSim {
+    // Deterministic seed (42) — replays must be bit-identical.
     let mut sim = BurnSim::new(dir, [0.0, 0.0], 42);
 
     // x0,y0,x1,y1, v,delay — progress 0.5 → the front sits at the
     // letter's vertical middle.
     sim.set_letters(&[0.0, 10.0, 10.0, 30.0, 1.0, 0.0]);
+
+    // Every column inked — spawns can land anywhere in the letter.
     sim.set_ink(&[1; 64]);
+
+    // Full 5-tint ramp — core/mid/edge/scorch + the smoke grey.
     sim.set_colors(&[
         1.0, 0.9, 0.5, 1.0, // core — white-hot
         1.0, 0.5, 0.1, 1.0, // mid — orange
@@ -32,10 +37,13 @@ fn fixture(dir: f32) -> BurnSim {
 /// Ticks the sim `steps` frames of `dt` seconds and returns the LAST
 /// frame's emitted quad records (stride `QUAD_F32S`).
 fn run(sim: &mut BurnSim, dt: f32, steps: usize) -> Vec<f32> {
+    // Reusable emit buffer — mirrors the widget's scratch Vec.
     let mut last = Vec::new();
 
+    // Tick `steps` frames, keeping only the final frame's quads.
     for _ in 0..steps {
         last.clear();
+
         sim.tick(dt, &mut last);
     }
 
@@ -60,8 +68,12 @@ fn particles_spawn_on_the_live_front() {
     // True front y = y1 − 0.15·(y1−y0) = 27; inverted front = 13.
     // Pool y must sit in the lower half of the letter — smoke/flame
     // offsets lift at most ~9 px, one 16ms tick adds ≤3 px of climb.
+    // Concatenate all three pools — the front check applies to every
+    // particle kind, not just sparks.
     let pools = [&sim.particles[..], &sim.smoke[..], &sim.flames[..]].concat();
 
+    // Every live mote must hug the TRUE front (lower half), not the
+    // inverted one the old bug produced.
     for p in &pools {
         assert!(
             p.y >= 15.0 && p.y <= 32.0,
@@ -148,6 +160,8 @@ fn embers_cool_and_wink_out() {
 
     assert!(first_gen > 0, "embers must exist to be tested");
 
+    // Scan the first generation for the hottest ejecta — at least one
+    // must leave near-white-hot or the thermal model isn't seeded.
     let mut birth_max = 0.0f32;
 
     for p in sim.particles.iter().filter(|p| p.kind == 0) {
@@ -160,6 +174,7 @@ fn embers_cool_and_wink_out() {
     // ember still live must be a younger spawn.
     run(&mut sim, 0.016, 100);
 
+    // No ember may outlive its fuel — life < 1.7 s proves wink-out.
     for p in sim.particles.iter().filter(|p| p.kind == 0) {
         assert!(p.life < 1.7, "a >1.6 s-old ember must have winked out");
     }
@@ -177,7 +192,10 @@ fn smoke_follows_the_plume_law() {
 
     assert!(!sim.smoke.is_empty(), "fixture must produce smoke");
 
+    // Every puff must satisfy the entrainment identity — size tracks
+    // the RISE coordinate, never age.
     for p in &sim.smoke {
+        // Expected diameter: birth size (stored in `temp`) + α·rise.
         let want = p.temp + SMOKE_ENTRAIN * p.rise;
 
         assert!(
