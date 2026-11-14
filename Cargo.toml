@@ -1,4 +1,4 @@
-# luiskr.com-V3 Rust/WebGPU workspace.
+# luiskr.com Rust/WebGPU workspace.
 #
 # Houses the crates that back the dual-layer render architecture:
 # each crate compiles to wasm32-unknown-unknown and is driven from the
